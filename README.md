@@ -1,64 +1,194 @@
-# Astro Starter Kit: Blog
+# ButtPad
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/astro-blog-starter-template)
+A pad of a few huge buttons for moments when you can't fiddle with a screen: on a ladder setting
+lights, mid-shoot, on a handlebar mount. Each button runs a preconfigured program or shell command
+on a **host** (any Linux/macOS/Windows box with Bun); any phone, tablet or laptop on the LAN is a
+remote via its browser. Buttons are little state machines — READY → (hold) → RUNNING → SUCCESS /
+FAILURE → READY — shown with color + motion + shape so you can read them at a glance.
 
-![Astro Template Preview](https://github.com/withastro/astro/assets/2244813/ff10799f-a816-4703-b967-c78997e8323d)
+![states](docs/screenshots/states-gallery-phone.png)
 
-<!-- dash-content-start -->
+Status: working prototype. Spec: [docs/DESIGN.md](docs/DESIGN.md).
 
-Create a blog with Astro and deploy it on Cloudflare Workers as a [static website](https://developers.cloudflare.com/workers/static-assets/).
+## Quick start
 
-Features:
+Needs a recent [Bun](https://bun.sh) on the host (developed on 1.4; macOS, Linux x64/arm64 incl. Raspberry Pi 4/5 with a
+64-bit OS; Windows should work but is untested): `curl -fsSL https://bun.sh/install | bash`.
 
-- ✅ Minimal styling (make it your own!)
-- ✅ 100/100 Lighthouse performance
-- ✅ SEO-friendly with canonical URLs and OpenGraph data
-- ✅ Sitemap support
-- ✅ RSS Feed support
-- ✅ Markdown & MDX support
-- ✅ Built-in Observability logging
-
-<!-- dash-content-end -->
-
-## Getting Started
-
-Outside of this repo, you can start a new project with this template using [C3](https://developers.cloudflare.com/pages/get-started/c3/) (the `create-cloudflare` CLI):
-
-```bash
-npm create cloudflare@latest -- --template=cloudflare/templates/astro-blog-starter-template
+```sh
+bun install
+bun run example        # host with the example config: fake lights/camera scripts, 3 pads
+bun start              # your own ./buttpad.config.json (a starter one is written if missing)
+bun src/server/main.ts --help    # --config, --port, --host, --rotate-tokens, --tls-cert/--tls-key …
 ```
 
-A live public deployment of this template is available at [https://astro-blog-starter-template.templates.workers.dev](https://astro-blog-starter-template.templates.workers.dev)
+It prints a **press URL** (and a QR code) and an **admin URL**. Open one on your phone (same
+network; the host's firewall must allow the port, 8787 by default). The token in the URL pairs the
+device and is then stripped from the address bar. **The QR code pairs a press-only device.**
 
-## 🚀 Project Structure
+To make a phone an admin without typing a token, use a **pairing code**: the host prints one at
+startup ("Pair a phone as admin: … enter 724 490, valid 10 min"), and an admin device can mint more
+(menu → *Pair another device…*). On the phone, open the page and tap **Pair with a code**. Codes are
+6 digits, single use, expire after 10 minutes and are rate limited; `--no-pair-code` turns the
+startup code off.
 
-Astro looks for `.astro` or `.md` files in the `src/pages/` directory. Each page is exposed as a route based on its file name.
+- `bun start` uses `./buttpad.config.json`, writing a harmless starter config if it's missing.
+- No host handy? Open any host's page with `?demo` — an in-browser simulation of the whole thing.
+- `?pad=lights` opens a pad; `?lock` hides navigation (kiosk); `?gallery` shows every button state.
 
-There's nothing special about `src/components/`, but that's where we like to put any Astro/React/Vue/Svelte/Preact components.
+Saving from the editor rewrites the config file, so `bun run example` edits
+`examples/buttpad.example.json` in place — copy `examples/` somewhere if you care.
 
-The `src/content/` directory contains "collections" of related Markdown and MDX documents. Use `getCollection()` to retrieve posts from `src/content/blog/`, and type-check your frontmatter using an optional schema. See [Astro's Content Collections docs](https://docs.astro.build/en/guides/content-collections/) to learn more.
+## Config
 
-Any static assets, like images, can be placed in the `public/` directory.
+One JSON file (schema: `schema/buttpad.config.schema.json`, generated from
+`src/core/config.ts`). Hand edits are picked up live; invalid edits are reported to admins and the
+previous config keeps running. The admin UI's edit mode writes the same file.
 
-## 🧞 Commands
+```json
+{
+  "version": 1,
+  "pads": [
+    {
+      "id": "lights", "name": "Lights", "cols": 2, "rows": 3,
+      "buttons": [
+        { "id": "key", "label": "Key light", "x": 0, "y": 0, "w": 2,
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["key", "on"] } },
+        { "id": "off", "label": "All off", "x": 0, "y": 1, "confirm": true, "key": "0",
+          "action": { "type": "shell", "script": "curl -fsS http://hue.local/off && echo '@result Lights off'" } }
+      ]
+    }
+  ]
+}
+```
 
-All commands are run from the root of the project, from a terminal:
+Actions:
 
-| Command                           | Action                                           |
-| :-------------------------------- | :----------------------------------------------- |
-| `npm install`                     | Installs dependencies                            |
-| `npm run dev`                     | Starts local dev server at `localhost:4321`      |
-| `npm run build`                   | Build your production site to `./dist/`          |
-| `npm run preview`                 | Preview your build locally, before deploying     |
-| `npm run astro ...`               | Run CLI commands like `astro add`, `astro check` |
-| `npm run astro -- --help`         | Get help using the Astro CLI                     |
-| `npm run build && npm run deploy` | Deploy your production site to Cloudflare        |
-| `npm wrangler tail`               | View real-time logs for all Workers              |
+- `exec` runs argv directly (no shell). `shell` runs a command string with `/bin/sh -c` (`cmd /c`
+  on Windows) — deliberately not `$SHELL`, so a button behaves the same from a terminal and from a
+  service; set `"shell": "bash"` for bash-isms. `none` runs nothing (for stop buttons, below).
+- `cwd` defaults to the config file's folder; a relative `command` resolves against `cwd`. env gets
+  `BUTTPAD_PAD`, `BUTTPAD_BUTTON`, `BUTTPAD_RUN_ID` (keeps increasing across restarts), `BUTTPAD_LABEL`.
+- Exit code 0 = SUCCESS. Script output protocol (stdout lines):
+  `@progress 40` (determinate fill), `@status warming up`, `@result Key light ON 80%`, and
+  `@state REC ●` — a device-state chip that stays on the button across runs and restarts (`@state`
+  alone clears it). `@state:<pad>/<button> OFF` sets (bare: clears) another button's chip, e.g. All
+  off resetting each light's "ON 80%". Without `@result`, the last stdout line is the result text
+  (stderr's on failure).
+- Background processes a script starts are left alone when it exits (ButtPad stops reading their
+  output); cancelling or a timeout kills the whole process group.
 
-## 👀 Want to learn more?
+Per button (defaults in parentheses):
 
-Check out [our documentation](https://docs.astro.build) or jump into our [Discord server](https://astro.build/chat).
+| Field | |
+|---|---|
+| `x y w h` | grid cell and span (`w`,`h` = 1) |
+| `label`, `color` | ≤ 200 chars; any opaque CSS color (`#2f6fde`) — avoid green/red, they read as results |
+| `trigger` | `hold` (default), `tap`, `double` |
+| `holdMs` (500), `driftPx` (60) | how long to hold; how far a finger may slide |
+| `confirm` (false), `confirmWindowMs` (3000) | needs a second, deliberate press — enforced by the host |
+| `whileRunning` | `ignore` (default), `cancel` (press again to stop; not within 700 ms of the start), `queue` (one re-run) |
+| `cooldownMs` (400) | presses right after a fire are ignored on that device (key chatter, bounces) |
+| `timeoutMs` (120000), `resultHoldMs` (2500) | run time limit; how long ✓ shows (failures stay until the next run or ✕) |
+| `key` | KeyboardEvent.key (BLE remotes/clickers): fires on keydown; the visible pad wins, else the unique match on any pad |
+| `stops` | `["lights/*"]`, `["camera/rec"]`, `["*"]`: running buttons to cancel before this one starts |
 
-## Credit
+Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:8787/api/press/lights/key`
+(add `?confirm=1` for confirm buttons; otherwise it's refused with 428).
 
-This theme is based off of the lovely [Bear Blog](https://github.com/HermanMartinus/bearblog/).
+## Security model (read this)
+
+- Two tokens in `buttpad.secrets.json` (0600): **press** (push buttons) and **admin** (edit the
+  config — i.e. run any command on the host; treat it like an SSH key). `--rotate-tokens` revokes all.
+- Browsers only ever name a pad + button; commands live in the host's config and are never sent to
+  press-role devices. Press devices do see each run's one-line result text, so don't print secrets.
+- Presses carry the time they were made; the host drops any older than 3 s (a press stuck in a
+  dead Wi-Fi zone must never fire late). `confirm` is checked by the host, not just the UI — but it
+  guards against accidents, not against a press-token holder (who can always confirm).
+- Plain HTTP by default — use it on a network you trust, or `--tls-cert/--tls-key` (e.g. mkcert).
+- Limits: 64 sockets (8 reserved for admin, 16 per address), press rate limits per device and
+  global, 32 concurrent runs, same-origin WebSockets only.
+- `buttpad.state.json` (0600, next to the config) keeps run ids, last results, `@state` chips and
+  live process groups, so after a crash the host kills orphaned actions and marks them INTERRUPTED.
+
+## In the field
+
+- Results: ✓ shows for `resultHoldMs`; ✗ (and NO RESPONSE / DIDN'T RUN / INTERRUPTED) stays until
+  the next run — pressing it again retries, its small ✕ clears it without firing. READY buttons show
+  how their last run went ("✓ 12 s ago").
+- Menu → **Rough mode** for gloves/vibration: one button at a time, longer minimum tap, longer
+  cooldown, more drift tolerance. Recommended whenever you wear gloves.
+- `?lock&pad=lights` for a mounted tablet: no tabs, menu only on long-press; if that pad is renamed
+  or deleted it says so instead of becoming another pad's remote.
+- Menu → **Show mode** for dark rooms: dim faces, results as a colored edge + glyph instead of a
+  full-screen flood, no bright flashes.
+
+## Recipes
+
+- **Status check** ("is the printer done?"): print the answer as `@state` so it stays on the button,
+  e.g. `echo "@state printing 37%"`; exit 0 either way so it doesn't look like a failure.
+- **Long actions** (a garage door, a fade): print `@state` / `@status` first (`@state OPENING`),
+  then progress (`@progress 40`), then the final `@state OPEN`. If the host restarts mid-run the
+  button shows INTERRUPTED.
+- **Stop everything**: a button with `"action": {"type": "none"}`, `"stops": ["*"]`, `"confirm": true`.
+- **Bash scripts**: `"shell": "bash"` — the default is `/bin/sh`.
+
+## Running it for real
+
+A systemd unit (Linux), `/etc/systemd/system/buttpad.service`:
+
+```ini
+[Unit]
+Description=ButtPad
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/buttpad
+ExecStart=/home/pi/.bun/bin/bun src/server/main.ts --config /home/pi/buttpad/buttpad.config.json --no-qr
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`sudo systemctl enable --now buttpad`; `journalctl -u buttpad` shows the pairing URLs and the run
+log. Or `bun run compile` and run the single `dist/buttpad` binary anywhere.
+
+## Behind a proxy, tunnel or preview pane
+
+ButtPad refuses WebSocket connections from pages of another origin. When the page is served
+through a reverse proxy (a tunnel, a TLS terminator, the Claude app's preview pane), start the host
+with that origin allowed — the page and the host log both print the exact flag when they refuse:
+
+```sh
+bun src/server/main.ts --allow-origin https://your-proxy.example   # repeatable; or BUTTPAD_ALLOW_ORIGINS
+```
+
+Then pair with a code (restarting the host prints a new one).
+
+## Keep-awake
+
+The Wake Lock API needs HTTPS; on a plain-HTTP LAN page ButtPad falls back to a muted looping video
+(the NoSleep trick). The menu shows which one is active. Belt and braces: set the device's
+auto-lock to "never" while you work, and on iOS consider Guided Access.
+
+## Development
+
+```sh
+bun run dev         # host with --dev (HMR, source maps) — never on an untrusted network
+bun test            # host + core: unit and integration tests (real processes, real sockets)
+bun run e2e         # Playwright, phone + desktop projects, demo backend and real host
+bun run typecheck
+bun run compile     # single-file executable in dist/buttpad (web app embedded)
+```
+
+Layout: `src/core` (the contract: config schema, protocol, state machine — what a future native
+app would share), `src/server` (host), `src/web` (Preact client), `examples/` (fake device scripts
+for dogfooding), `test/`, `e2e/`, `docs/` (spec, QA log, screenshots).
+
+## Ideas not built yet
+
+- Native iOS app (App Intents, Lock Screen / Action button) using the same config + protocol.
+- A Mac menu-bar host; Shortcuts / AppleScript action types.
+- Per-orientation layouts; progress from long-running background jobs; MQTT/HTTP action types.

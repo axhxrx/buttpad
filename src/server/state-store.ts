@@ -1,0 +1,1004 @@
+/**
+ * Owns the RunState of every button: feeds events through `transition()` (src/core/machine.ts),
+ * performs its effects (spawn, kill, reset and requeue timers) and reports every state change.
+ *
+ * Also: the press gate (stale presses, confirm, rate limits, never two instances of a button),
+ * `stops`, latched device state (`@state`), the run history behind GET /api/runs, and what
+ * survives a restart or a crash (buttpad.state.json, see persist.ts).
+ */
+import { buttonKey, type Button, type Config } from '../core/config.ts';
+import { transition, type Effect, type LastResult, type MachineEvent, type RunState } from '../core/machine.ts';
+import type { PressResult, RunRecord, StateMap } from '../core/protocol.ts';
+import { BucketMap, ThrottledLog, TokenBucket, type PressSource } from './limits.ts';
+import {
+  HISTORY_SIZE,
+  loadRuns,
+  loadState,
+  RUNS_SAVE_INTERVAL_MS,
+  runsFileText,
+  runsPathFor,
+  StateFile,
+  UNCERTAIN_PREFIX,
+  type ButtonMemo,
+  type LiveEntry,
+  type PersistedState,
+} from './persist.ts';
+import { Leftover, processFingerprint, processFingerprintAsync } from './proc.ts';
+import {
+  clip,
+  finishedRun,
+  KILL_GRACE_MS,
+  LATCHED_MAX,
+  MAX_DELAY_MS,
+  sanitize,
+  sanitizeLog,
+  startRun,
+  type RunHandle,
+  type RunHooks,
+  type RunOutcome,
+  type RunSpec,
+  type RunUpdate,
+} from './runner.ts';
+
+export { HISTORY_SIZE };
+/**
+ * Backstop for the run log: over all buttons, at most this much stored output (stdout + stderr
+ * tails, in characters); past it the oldest runs that hold output are dropped, down to 3/4 of it.
+ */
+export const HISTORY_OUTPUT_MAX = 32 * 1024 * 1024;
+/** A cancel press this soon after its run started is taken as a double press, not a cancel: ignored. */
+export const CANCEL_GRACE_MS = 700;
+/** A queued re-run waiting for the previous run's processes to go (or for a free slot) looks again this often. */
+const REQUEUE_RETRY_MS = 100;
+/** Buttons whose memo (last run id, result) is kept although they're no longer in the config. */
+const MAX_MEMOS = 1000;
+/** A run the host lost track of (it stopped or crashed while the run went on). */
+export const INTERRUPTED_TEXT = 'Interrupted: host restarted';
+/** Result of an action `none` whose `stops`/group found nothing running (nor a queued re-run) to stop. */
+export const NOTHING_RUNNING = 'Nothing was running';
+
+/** How the host stopped a run: RunRecord.error, and the host log. */
+export const STOP_REASONS = {
+  device: 'cancelled from a device',
+  removed: 'stopped: button removed by a config change',
+  shutdown: 'stopped: host shutdown',
+  by: (label: string) => `stopped by ${label}`,
+} as const;
+
+/** Limits on presses that start (or queue) a run. A press they refuse gets the result "ignored". */
+export interface StartLimits {
+  /** Over all sources together, a token bucket: up to `burst` at once… */
+  burst: number;
+  /** …refilled at `perSec`. */
+  perSec: number;
+  /** The same per source: each WebSocket connection, and each client address (all its connections and HTTP presses together), so no one device can use up everyone's. */
+  sourceBurst: number;
+  sourcePerSec: number;
+  /** Runs at the same time. */
+  maxRunning: number;
+}
+export const START_LIMITS: StartLimits = { burst: 40, perSec: 20, sourceBurst: 10, sourcePerSec: 5, maxRunning: 32 };
+
+export interface PressOptions {
+  /** When the user pressed, by the host's clock (epoch ms). Older than the button's maxLatenessMs → `expired`; later than now counts as now; absent = now. */
+  at?: number;
+  /** The user went through the button's confirm step: needed to start (or queue) a `confirm` button. */
+  confirm?: boolean;
+  /** Who pressed: its own rate limit, and log lines. */
+  source?: PressSource;
+  /** Gets the result before any state change is reported, so an ack can precede the broadcasts. */
+  onResult?(reply: PressReply): void;
+}
+
+export interface PressReply {
+  result: PressResult;
+  key: string;
+  /** started: the run it started; queued: the run it's queued behind; cancelling: the run being cancelled. */
+  runId?: number;
+  /** Why a limit refused it (result `ignored`): `rate` = presses coming too fast, `busy` = too many runs at once. */
+  refused?: 'rate' | 'busy';
+  /** The button's state after the press. */
+  state?: RunState;
+}
+
+/** Something whose processes may still be alive: a run, or a group a previous host left behind. */
+interface Straggler {
+  key: string;
+  handle: Pick<RunHandle, 'alive' | 'dying' | 'forceKill'>;
+}
+
+interface LiveRun extends Straggler {
+  runId: number;
+  handle: RunHandle;
+  record: RunRecord;
+  /** Start time on the monotonic clock. */
+  t0: number;
+  timeoutMs: number;
+  /** The host stopped it (RunRecord.error): cancel press, `stops`, button removed, shutdown. */
+  stopReason?: string;
+  /** Who sent the cancel, for the log. */
+  stopSource?: string;
+  /** Failure text instead of the run's own output (stopped by another button). */
+  stopText?: string;
+  /** Its button was removed from the config while it ran, and the kill reached it. */
+  orphaned?: boolean;
+  /** Its entry in buttpad.state.json `live`. */
+  entry?: LiveEntry;
+  /** Action `none`: nothing runs, so it never counts toward maxRunning. */
+  none: boolean;
+}
+
+interface Slot {
+  key: string;
+  pad: string;
+  button: Button;
+  state: RunState;
+  run?: LiveRun;
+  resetTimer?: ReturnType<typeof setTimeout>;
+  requeueTimer?: ReturnType<typeof setTimeout>;
+}
+
+export interface StateStoreOptions {
+  /** Directory actions' relative paths resolve against (the config file's directory). */
+  baseDir: string;
+  onState?(key: string, state: RunState): void;
+  /** A button's latched device state (`@state`) changed; null = cleared. */
+  onLatched?(key: string, text: string | null): void;
+  onRunStart?(key: string, runId: number, button: Button): void;
+  onRunEnd?(key: string, record: RunRecord, outcome: RunOutcome, run: { stopSource?: string }): void;
+  /** Messages for the operator, e.g. that the limits refuse presses. */
+  log?(msg: string): void;
+  /** buttpad.state.json; without it nothing survives a restart. */
+  statePath?: string;
+  /** Injection point for tests: writes the state file (default: atomic write). */
+  stateWrite?: (path: string, text: string) => void;
+  /** The run log across restarts (default: buttpad.runs.json next to the state file; see persist.ts runsPathFor). */
+  runsPath?: string;
+  /** Injection point for tests: writes the run log file (default: atomic write, 0600). */
+  runsWrite?: (path: string, text: string) => void;
+  cancelGraceMs?: number;
+  limits?: Partial<StartLimits>;
+  /** Injection points for tests. */
+  spawn?: (spec: RunSpec, hooks: RunHooks) => RunHandle;
+  /** Epoch ms, for the timestamps clients display and the age of presses. */
+  now?: () => number;
+  /** Monotonic ms, for the cancel grace, the rate limits and log throttling. */
+  clock?: () => number;
+}
+
+/** Whether a `stops` pattern list (`pad/button`, `pad/*`, `*`) covers this button. */
+export function matchesStop(patterns: readonly string[], pad: string, button: string): boolean {
+  return patterns.some((p) => p === '*' || p === `${pad}/*` || p === `${pad}/${button}`);
+}
+
+/**
+ * Whether `self`, about to start, stops `other` first: `other` is named by its `stops`, or is in
+ * its `group` (on any pad). Never itself.
+ */
+export function stopsBeforeStart(self: { pad: string; button: Button }, other: { pad: string; button: Button }): boolean {
+  if (self.pad === other.pad && self.button.id === other.button.id) return false;
+  const group = self.button.group;
+  if (group !== undefined && other.button.group === group) return true;
+  return !!self.button.stops?.length && matchesStop(self.button.stops, other.pad, other.button.id);
+}
+
+/** Whether a button stops anything when it starts (`stops`, or a `group`). */
+const stopsAny = (b: Button) => !!b.stops?.length || b.group !== undefined;
+
+/** How a finished run ended, as READY's `last` will say it (the machine's rule). */
+function lastOf(s: RunState): LastResult | undefined {
+  if (s.phase === 'ready') return s.last;
+  if (s.phase === 'running') return undefined;
+  const last: LastResult = { runId: s.runId, ok: s.phase === 'success', endedAt: s.endedAt };
+  if (s.phase === 'failure') last.reason = s.reason;
+  if (s.text !== undefined) last.text = s.text;
+  return last;
+}
+
+const sameLast = (a: LastResult | undefined, b: LastResult | undefined) =>
+  a === b || (!!a && !!b && a.runId === b.runId && a.ok === b.ok && a.reason === b.reason && a.text === b.text && a.endedAt === b.endedAt);
+
+const outputChars = (r: RunRecord) => r.stdout.length + r.stderr.length;
+
+const seconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+const duration = (ms: number) => (ms < 1000 ? `${ms} ms` : ms < 120_000 ? `${+(ms / 1000).toFixed(1)} s` : `${+(ms / 60_000).toFixed(1)} min`);
+
+export class StateStore {
+  private slots = new Map<string, Slot>();
+  private history = new Map<string, RunRecord[]>();
+  private live = new Set<LiveRun>();
+  /** Killed runs whose action exited while the rest of their process group may live on (SIGKILL pending), and leftovers of a previous host. */
+  private dying = new Set<Straggler>();
+  /** Per button: last run id, last result, latched state. Persisted; outlives the button (ids keep increasing if it comes back). */
+  private memos = new Map<string, ButtonMemo>();
+  /** buttpad.state.json `live`: runs in flight, and the ones a shutdown stopped. */
+  private liveEntries = new Set<LiveEntry>();
+  /** Left in flight by the previous host, for recover(). */
+  private toRecover: LiveEntry[] = [];
+  /** The state file wasn't private (persist.ts notPrivate): `toRecover` is reported, never signalled. */
+  private recoverUntrusted = false;
+  /** Output characters (stdout + stderr) of the finished records in `history`, for HISTORY_OUTPUT_MAX. */
+  private historyChars = 0;
+  /** What loading the state file found, logged by recover(): once the host is listening, not before a failed start. */
+  private loadNotes: string[] = [];
+  private persist: StateFile | undefined;
+  /** The run log file (buttpad.runs.json): saved like the state file, less often. */
+  private runsFile: StateFile | undefined;
+  private hostId: PersistedState['host'];
+  private closed = false;
+  private readonly spawn: NonNullable<StateStoreOptions['spawn']>;
+  private readonly now: () => number;
+  private readonly clock: () => number;
+  private readonly cancelGraceMs: number;
+  private readonly limits: StartLimits;
+  private readonly bucket: TokenBucket;
+  private readonly ipBuckets: BucketMap;
+  private readonly refusals: ThrottledLog;
+  private readonly expired: ThrottledLog;
+  private readonly unconfirmed: ThrottledLog;
+  /** `@state:<pad>/<button>` naming no button. */
+  private readonly unknownLatched: ThrottledLog;
+
+  constructor(
+    config: Config,
+    private opts: StateStoreOptions,
+  ) {
+    this.spawn = opts.spawn ?? startRun;
+    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? (() => performance.now());
+    this.cancelGraceMs = opts.cancelGraceMs ?? CANCEL_GRACE_MS;
+    this.limits = { ...START_LIMITS, ...opts.limits };
+    this.bucket = new TokenBucket(this.limits.burst, this.limits.perSec, this.clock);
+    this.ipBuckets = new BucketMap(() => new TokenBucket(this.limits.sourceBurst, this.limits.sourcePerSec, this.clock));
+    const log = (m: string) => this.log(m);
+    this.refusals = new ThrottledLog(log, this.clock);
+    this.expired = new ThrottledLog(log, this.clock);
+    this.unconfirmed = new ThrottledLog(log, this.clock);
+    this.unknownLatched = new ThrottledLog(log, this.clock);
+    if (opts.statePath) this.load(opts.statePath);
+    this.setConfig(config);
+  }
+
+  /**
+   * A press source with its own rate limit, e.g. one WebSocket connection. With `address`, it also
+   * draws from that address's bucket (shared with the address's other connections and its HTTP
+   * presses), so a device can't get past the limit by opening more connections.
+   */
+  newSource(label: string, address?: string): PressSource {
+    const own = new TokenBucket(this.limits.sourceBurst, this.limits.sourcePerSec, this.clock);
+    return { label, buckets: address === undefined ? [own] : [own, this.ipBuckets.get(address)] };
+  }
+
+  /** The press source of an HTTP client: its address's bucket. */
+  addressSource(address: string, label = `http ${address}`): PressSource {
+    return { label, buckets: [this.ipBuckets.get(address)] };
+  }
+
+  /**
+   * Reconcile with a new config. Removed buttons lose their state (and a running action is killed);
+   * kept buttons pick up their new settings, but a current run keeps the action it started with —
+   * except its time limit: a changed `timeoutMs` applies to the run going on (see `retime`).
+   * Returns the keys of added buttons.
+   */
+  setConfig(config: Config): string[] {
+    const wanted = new Map<string, { pad: string; button: Button }>();
+    for (const p of config.pads) for (const b of p.buttons) wanted.set(buttonKey(p.id, b.id), { pad: p.id, button: b });
+    for (const [key, slot] of this.slots) if (!wanted.has(key)) this.removeSlot(slot);
+    const added: string[] = [];
+    for (const [key, { pad, button }] of wanted) {
+      const slot = this.slots.get(key);
+      if (slot) {
+        slot.button = button;
+        if (slot.run && slot.run.timeoutMs !== button.timeoutMs) this.retime(slot.run, button.timeoutMs);
+        continue;
+      }
+      // Keep runIds increasing for a key that comes back (or across a restart), so clients never see
+      // an old runId reused. The counter is the memo's (buttpad.state.json's), never the run log's:
+      // that is display data (a crafted runId there froze the ids).
+      const memo = this.memos.get(key);
+      const runId = memo?.lastRunId ?? 0;
+      const state: RunState = memo?.last ? { phase: 'ready', runId, last: memo.last } : { phase: 'ready', runId };
+      this.slots.set(key, { key, pad, button, state });
+      added.push(key);
+    }
+    this.trimMemos();
+    this.dropRemovedHistory();
+    return added;
+  }
+
+  /**
+   * Handle a press. Results other than started/queued/cancelling run nothing: `unknown-button`,
+   * `expired` (older than the button's maxLatenessMs by the host's clock: it sat in a dead link or
+   * a stalled host), `needs-confirm` (a `confirm` button pressed without `confirm`), `ignored` (running
+   * with whileRunning `ignore`, already queued, a cancel within the double-press grace, an earlier
+   * run of the button still dying, or refused by the limits: then `refused` says which).
+   */
+  press(padId: string, buttonId: string, o: PressOptions = {}): PressReply {
+    const key = buttonKey(padId, buttonId);
+    const slot = this.slots.get(key);
+    const reply = (result: PressResult, extra: Partial<PressReply> = {}): PressReply => {
+      const r: PressReply = { result, key, ...extra, state: slot?.state };
+      o.onResult?.(r);
+      return r;
+    };
+    if (!slot) return reply('unknown-button');
+    if (this.closed) return reply('ignored');
+    const from = o.source ? ` from ${o.source.label}` : '';
+    const now = this.now();
+    const maxAge = slot.button.maxLatenessMs;
+    if (o.at !== undefined && now - o.at > maxAge) {
+      this.expired.note(`dropped a stale press of ${key}${from}: made ${seconds(now - o.at)} ago (max ${seconds(maxAge)}); it was held up on the way`);
+      return reply('expired');
+    }
+    const prev = slot.state;
+    const mode = slot.button.whileRunning;
+    const running = prev.phase === 'running';
+    // A queued re-run is already coming (still running, or showing the result before it starts).
+    if (prev.phase !== 'ready' && prev.queued && (!running || mode === 'queue')) return reply('ignored');
+    const starts = !running;
+    const queues = running && mode === 'queue';
+    if ((starts || queues) && slot.button.confirm && !o.confirm) {
+      this.unconfirmed.note(`refused a press of ${key}${from}: the button needs confirm (WebSocket "confirm": true, HTTP ?confirm=1)`);
+      return reply('needs-confirm');
+    }
+    if (running && mode === 'ignore') return reply('ignored');
+    // A double press would start the run and cancel it right away.
+    if (running && mode === 'cancel' && !prev.cancelling && slot.run && this.clock() - slot.run.t0 < this.cancelGraceMs) return reply('ignored');
+    if (starts || queues) {
+      const why = this.gate(slot, starts, o.source);
+      if (why) return reply('ignored', why === 'dying' ? {} : { refused: why });
+    }
+    const [next, effects] = transition(prev, { type: 'press', now }, this.machineOpts(slot));
+    // A cancel must reach the process. If the action already exited and only its output is still
+    // draining, it's too late: the run ends as what it was.
+    const kill = effects.find((e) => e.type === 'kill');
+    if (kill && !this.stop(slot.run, kill.runId, { reason: STOP_REASONS.device, source: o.source?.label })) return reply('ignored');
+    const result: PressResult = starts ? 'started' : mode === 'cancel' ? 'cancelling' : 'queued';
+    const r: PressReply = { result, key, runId: next.runId };
+    o.onResult?.(r);
+    this.apply(slot, next, kill ? effects.filter((e) => e !== kill) : effects);
+    r.state = slot.state;
+    return r;
+  }
+
+  get(key: string): RunState | undefined {
+    return this.slots.get(key)?.state;
+  }
+
+  states(): StateMap {
+    const out: StateMap = {};
+    for (const [key, slot] of this.slots) out[key] = slot.state;
+    return out;
+  }
+
+  /** Latched device state (`@state`) of the buttons in the config. */
+  latched(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const key of this.slots.keys()) {
+      const t = this.memos.get(key)?.latched;
+      if (t) out[key] = t;
+    }
+    return out;
+  }
+
+  /** Newest first. Running records carry their output so far. */
+  runs(filter: { pad?: string; button?: string } = {}): RunRecord[] {
+    const out: RunRecord[] = [];
+    for (const records of this.history.values())
+      for (const r of records) if ((!filter.pad || r.pad === filter.pad) && (!filter.button || r.button === filter.button)) out.push(r);
+    const liveByRecord = new Map([...this.live].map((l) => [l.record, l.handle]));
+    return out
+      .sort((a, b) => b.startedAt - a.startedAt || b.runId - a.runId)
+      .map((r) => {
+        const h = liveByRecord.get(r);
+        return h ? { ...r, stdout: h.stdout(), stderr: h.stderr() } : { ...r };
+      });
+  }
+
+  /** Number of actions currently running (including ones whose button was removed). Action `none` runs nothing: not counted. */
+  get running(): number {
+    let n = 0;
+    for (const r of this.live) if (!r.none) n++;
+    return n;
+  }
+
+  /**
+   * Deal with the runs the previous host left in flight (buttpad.state.json `live`): a run whose
+   * process is still alive and provably the same one (start-time fingerprint; a PID can be reused)
+   * is stopped like a cancel (SIGTERM to its process group, SIGKILL after 2 s) — but only when the
+   * state file is private (persist.ts notPrivate): anyone can compute a fingerprint, so a file
+   * someone else could have written never gets a process signalled. Every such button shows
+   * FAILURE `interrupted` for its resultHoldMs, then READY with that as `last`. Call once, after
+   * the host knows it is the only one (it got its port).
+   */
+  recover() {
+    for (const m of this.loadNotes.splice(0)) this.log(m);
+    const entries = this.toRecover;
+    const trusted = !this.recoverUntrusted;
+    this.toRecover = [];
+    this.recoverUntrusted = false;
+    for (const e of entries) {
+      let how = 'it had already ended';
+      if (trusted && e.fingerprint && processFingerprint(e.pid) === e.fingerprint) {
+        // Still running, and the same process (not a later one that got its PID): stop its group.
+        this.dying.add({ key: e.key, handle: new Leftover(e.pgid, e.pid, KILL_GRACE_MS) });
+        how = `still running as pid ${e.pid}: stopping it`;
+      } else if (e.stopped === 'shutdown') how = 'stopped by the shutdown';
+      else if (processFingerprint(e.pid)) how = trusted ? `pid ${e.pid} is another process now: left alone` : `pid ${e.pid} left alone: the state file is not private`;
+      this.log(`■ ${e.key} #${e.runId} was interrupted when the previous host stopped (${how})`);
+      const endedAt = e.endedAt ?? this.now();
+      const [pad = '', button = ''] = e.key.split('/');
+      // A graceful shutdown saved the run in the run log as it ended (with its output): that one stays.
+      if (!this.history.get(e.key)?.some((r) => r.runId === e.runId))
+        this.addRecord(e.key, {
+          runId: e.runId,
+          pad,
+          button,
+          startedAt: e.startedAt,
+          endedAt,
+          exitCode: null,
+          reason: 'interrupted',
+          error: e.stopped === 'shutdown' ? STOP_REASONS.shutdown : `interrupted: the host stopped while it ran (${how})`,
+          ...(e.command !== undefined ? { command: e.command } : {}),
+          ...(e.cwd !== undefined ? { cwd: e.cwd } : {}),
+          stdout: '',
+          stderr: '',
+        });
+      const memo = this.memo(e.key);
+      if (e.runId < memo.lastRunId) continue; // a newer run is known: this one is old news
+      memo.last = { runId: e.runId, ok: false, reason: 'interrupted', text: INTERRUPTED_TEXT, endedAt };
+      // Cut off by a crash: what it last latched (`@state`) may no longer be what the device is
+      // doing. (A graceful shutdown saw the run end, as a cancel does: its state stands.)
+      if (e.stopped !== 'shutdown' && memo.latched && !memo.latched.startsWith(UNCERTAIN_PREFIX)) {
+        memo.latched = UNCERTAIN_PREFIX + memo.latched;
+        this.opts.onLatched?.(e.key, memo.latched);
+      }
+      const slot = this.slots.get(e.key);
+      if (slot?.state.phase === 'ready' && slot.state.runId === e.runId)
+        this.apply(
+          slot,
+          { phase: 'failure', runId: e.runId, startedAt: e.startedAt, endedAt, exitCode: null, reason: 'interrupted', text: INTERRUPTED_TEXT },
+          [{ type: 'scheduleReset', runId: e.runId, afterMs: slot.button.resultHoldMs }],
+        );
+    }
+    if (entries.length) {
+      this.persist?.flush();
+      this.runsFile?.request();
+    }
+  }
+
+  /** Stop accepting presses, SIGTERM every running action, SIGKILL what's left after `graceMs`, save the state file. */
+  async shutdown(graceMs = KILL_GRACE_MS): Promise<void> {
+    this.closed = true;
+    for (const slot of this.slots.values()) {
+      clearTimeout(slot.resetTimer);
+      clearTimeout(slot.requeueTimer);
+    }
+    for (const l of [this.refusals, this.expired, this.unconfirmed, this.unknownLatched]) l.close();
+    // Runs killed earlier that are still in their grace period get the rest of it, like the running ones.
+    const runs: Straggler[] = [...this.live, ...this.stragglers()];
+    const ending = [...this.live];
+    for (const r of this.live) this.stop(r, r.runId, { reason: STOP_REASONS.shutdown });
+    const deadline = performance.now() + graceMs;
+    while (runs.some((r) => r.handle.alive()) && performance.now() < deadline) await Bun.sleep(20);
+    this.forceKillAll(runs);
+    // Let the killed runs report (run log, host log) before the state is saved for the last time.
+    await Promise.race([Promise.all(ending.map((r) => r.handle.done)), Bun.sleep(1000)]);
+    this.persist?.flush();
+    this.persist?.close();
+    this.runsFile?.flush();
+    this.runsFile?.close();
+  }
+
+  /**
+   * Synchronous last resort (process 'exit' handler): SIGKILL every running or dying action. Their
+   * entries stay in the state file, so the next host says those runs were interrupted.
+   */
+  forceKillAll(runs: Iterable<Straggler> = [...this.live, ...this.stragglers()]) {
+    for (const r of runs) if (r.handle.alive()) r.handle.forceKill();
+    this.persist?.flush();
+    this.runsFile?.flush();
+  }
+
+  /** Every log line goes to a terminal: what's in it from the config or the state file (keys, labels, errors) can't carry escape sequences. */
+  private log(m: string) {
+    this.opts.log?.(sanitizeLog(m));
+  }
+
+  private machineOpts(slot: Slot) {
+    return { whileRunning: slot.button.whileRunning, resultHoldMs: slot.button.resultHoldMs };
+  }
+
+  /**
+   * Whether a press may start (or, `starts` false, queue) a run of `slot` now: never two instances
+   * of a button at once, at most maxRunning runs, and the rate limits (the source's, then the
+   * global one; a token is taken from both only when both have one). Action `none` spawns nothing:
+   * it is never refused by maxRunning; with `stops` and something to stop (an "All off"), it isn't
+   * rate limited either: an emergency stop always gets through. With nothing to stop it is an
+   * ordinary press, so a flood of them is still limited.
+   */
+  private gate(slot: Slot, starts: boolean, source?: PressSource): 'dying' | 'busy' | 'rate' | undefined {
+    const none = slot.button.action.type === 'none';
+    if (starts) {
+      // An earlier run of this key is still on its way out: one of a removed-and-re-added button, a
+      // killed run's process group in its grace period, or a leftover of the previous host.
+      if ([...this.live, ...this.stragglers()].some((r) => r.key === slot.key)) return 'dying';
+      const running = this.running;
+      if (!none && running >= this.limits.maxRunning) {
+        this.refusals.note(`refusing presses: ${running} actions are running (max ${this.limits.maxRunning})`);
+        return 'busy';
+      }
+    }
+    // An emergency stop gets through: `stops` (or a group) with something to stop.
+    if (none && this.wouldStop(slot)) return undefined;
+    if (source && !source.buckets.every((b) => b.available())) {
+      this.refusals.note(`refusing presses from ${source.label}: too many (max ${this.limits.sourceBurst} at once, then ${this.limits.sourcePerSec}/s per device)`);
+      return 'rate';
+    }
+    if (!this.bucket.available()) {
+      this.refusals.note(`refusing presses: too many from all devices together (max ${this.limits.burst} at once, then ${this.limits.perSec}/s)`);
+      return 'rate';
+    }
+    for (const b of source?.buckets ?? []) b.take();
+    this.bucket.take();
+    return undefined;
+  }
+
+  /** Whether `self`'s `stops` (or its group) would stop something now: a run it names that isn't being cancelled yet, or a queued re-run. */
+  private wouldStop(self: Slot): boolean {
+    if (!stopsAny(self.button)) return false;
+    for (const slot of this.slots.values()) {
+      if (slot === self || !stopsBeforeStart(self, slot)) continue;
+      const s = slot.state;
+      if ((s.phase === 'running' && !s.cancelling) || (s.phase !== 'ready' && s.queued)) return true;
+    }
+    return false;
+  }
+
+  /** The dying runs, minus those whose process group is gone or got its SIGKILL meanwhile. */
+  private stragglers(): Straggler[] {
+    for (const r of this.dying) if (!r.handle.dying()) this.dying.delete(r);
+    return [...this.dying];
+  }
+
+  private kill(slot: Slot, runId: number): boolean {
+    return slot.run?.runId === runId && slot.run.handle.kill();
+  }
+
+  /**
+   * Kill `run` (if it is run `runId`), saying why: RunRecord.error, and the text to show instead of
+   * its output. A reason it already has (an earlier kill) stays. Whether the kill reached it.
+   */
+  private stop(run: LiveRun | undefined, runId: number, why: { reason: string; source?: string; text?: string }): boolean {
+    if (!run || run.runId !== runId) return false;
+    const before = { stopReason: run.stopReason, stopSource: run.stopSource, stopText: run.stopText };
+    // Said before the kill, which may end the run at once.
+    run.stopReason ??= why.reason;
+    if (why.source !== undefined) run.stopSource ??= why.source;
+    if (why.text !== undefined) run.stopText ??= why.text;
+    if (run.handle.kill()) return true;
+    Object.assign(run, before);
+    return false;
+  }
+
+  private memo(key: string): ButtonMemo {
+    let m = this.memos.get(key);
+    if (!m) this.memos.set(key, (m = { lastRunId: 0 }));
+    return m;
+  }
+
+  /** Forget the memos of buttons gone from the config, oldest first, beyond MAX_MEMOS. */
+  private trimMemos() {
+    for (const key of this.memos.keys()) {
+      if (this.memos.size <= MAX_MEMOS) break;
+      if (!this.slots.has(key)) this.memos.delete(key);
+    }
+  }
+
+  private dispatch(slot: Slot, event: MachineEvent) {
+    if (this.slots.get(slot.key) !== slot) return; // button was removed
+    const [next, effects] = transition(slot.state, event, this.machineOpts(slot));
+    this.apply(slot, next, effects);
+  }
+
+  private apply(slot: Slot, next: RunState, effects: Effect[]) {
+    if (next !== slot.state) {
+      slot.state = next;
+      this.remember(slot.key, next);
+      this.opts.onState?.(slot.key, next);
+    }
+    for (const e of effects) this.perform(slot, e);
+  }
+
+  /** Keep the memo (persisted) up to date: run ids and how the last run ended. */
+  private remember(key: string, s: RunState) {
+    const m = this.memo(key);
+    let changed = false;
+    if (s.runId > m.lastRunId) {
+      m.lastRunId = s.runId;
+      changed = true;
+    }
+    const last = lastOf(s);
+    if (last && !sameLast(last, m.last)) {
+      m.last = last;
+      changed = true;
+    }
+    if (changed) this.persist?.request(true);
+  }
+
+  private perform(slot: Slot, e: Effect) {
+    switch (e.type) {
+      case 'start':
+        clearTimeout(slot.requeueTimer);
+        slot.requeueTimer = undefined;
+        this.startRun(slot, e.runId);
+        break;
+      case 'kill':
+        this.kill(slot, e.runId);
+        break;
+      case 'scheduleReset':
+        clearTimeout(slot.resetTimer);
+        slot.resetTimer = setTimeout(() => {
+          slot.resetTimer = undefined;
+          this.dispatch(slot, { type: 'reset', runId: e.runId });
+        }, Math.min(e.afterMs, MAX_DELAY_MS));
+        break;
+      case 'scheduleRequeue':
+        clearTimeout(slot.requeueTimer);
+        slot.requeueTimer = setTimeout(() => this.requeue(slot, e.runId), Math.min(e.afterMs, MAX_DELAY_MS));
+        break;
+    }
+  }
+
+  /** The queued re-run's turn (its result has been on screen REQUEUE_GAP_MS). */
+  private requeue(slot: Slot, runId: number) {
+    slot.requeueTimer = undefined;
+    if (this.closed || this.slots.get(slot.key) !== slot) return;
+    // Never two instances at once, and no more than maxRunning: wait for the earlier processes, or a free slot.
+    const busy = slot.button.action.type !== 'none' && this.running >= this.limits.maxRunning;
+    if (busy || [...this.live, ...this.stragglers()].some((r) => r.key === slot.key)) {
+      slot.requeueTimer = setTimeout(() => this.requeue(slot, runId), REQUEUE_RETRY_MS);
+      return;
+    }
+    this.dispatch(slot, { type: 'requeue', runId, now: this.now() });
+  }
+
+  /**
+   * `stops` and `group`: cancel the running buttons its patterns name and the running buttons of
+   * its group (any pad; never itself), dropping their queued re-runs. How many buttons it stopped
+   * (an action `none` says so: "Stopped 2"): each one running (killed now, or already on its way
+   * down from an earlier stop) or with a re-run it dropped. A run that had already exited, only its
+   * output still draining, doesn't count (unless a re-run was queued behind it).
+   */
+  private stopOthers(self: Slot): number {
+    // A label is anyone's text (the config): none of its escape sequences or controls in the result text, RunRecord.error or the log.
+    const by = sanitize(self.button.label).trim() || self.button.id;
+    let n = 0;
+    for (const slot of this.slots.values()) {
+      if (slot === self || !stopsBeforeStart(self, slot)) continue;
+      const s = slot.state;
+      if (s.phase === 'running') {
+        // The machine's cancel, whatever the button's own whileRunning: kill, and drop a queued re-run.
+        const [next, effects] = transition(s, { type: 'press', now: this.now() }, { whileRunning: 'cancel', resultHoldMs: slot.button.resultHoldMs });
+        const kill = effects.find((e) => e.type === 'kill');
+        if (kill && !this.stop(slot.run, kill.runId, { reason: STOP_REASONS.by(by), text: clip(`Stopped by ${by}`) })) {
+          // Exited already, output still draining: it ends as what it was, but its queued re-run is dropped all the same.
+          if (s.queued) {
+            const { queued: _queued, ...rest } = s;
+            this.apply(slot, rest, []);
+            n++;
+          }
+          continue;
+        }
+        // Killed now, or no kill needed: already being cancelled.
+        n++;
+        this.apply(slot, next, effects.filter((e) => e !== kill));
+      } else if (s.phase !== 'ready' && s.queued) {
+        // Its result is showing and a re-run is about to start: drop the re-run.
+        clearTimeout(slot.requeueTimer);
+        slot.requeueTimer = undefined;
+        const next = { ...s };
+        delete next.queued;
+        this.apply(slot, next, [{ type: 'scheduleReset', runId: s.runId, afterMs: slot.button.resultHoldMs }]);
+        n++;
+      }
+    }
+    return n;
+  }
+
+  private addRecord(key: string, record: RunRecord) {
+    const list = this.history.get(key) ?? [];
+    list.unshift(record);
+    for (const r of list.splice(HISTORY_SIZE)) this.historyChars -= outputChars(r);
+    this.history.set(key, list);
+    this.historyChars += outputChars(record);
+    this.capHistory();
+  }
+
+  /** A record's output was filled in (its run ended). */
+  private grewRecord(key: string, record: RunRecord, before: number) {
+    if (!this.history.get(key)?.includes(record)) return; // dropped meanwhile
+    this.historyChars += outputChars(record) - before;
+    this.capHistory();
+  }
+
+  /**
+   * The run log keeps the runs of the buttons in the config. A removed button's records go with it,
+   * except the record of a run still going (one the config change killed): that one stays until the
+   * next config change, so the run log shows what the change stopped.
+   */
+  private dropRemovedHistory() {
+    let live: Set<RunRecord> | undefined;
+    for (const [key, list] of this.history) {
+      if (this.slots.has(key)) continue;
+      live ??= new Set([...this.live].map((r) => r.record));
+      const kept = list.filter((r) => live!.has(r));
+      for (const r of list) if (!live.has(r)) this.historyChars -= outputChars(r);
+      if (kept.length) this.history.set(key, kept);
+      else this.history.delete(key);
+      if (kept.length < list.length) this.runsFile?.request();
+    }
+  }
+
+  /** Over HISTORY_OUTPUT_MAX: drop the oldest finished records that hold output, down to 3/4 of it (so this rarely runs). */
+  private capHistory() {
+    if (this.historyChars <= HISTORY_OUTPUT_MAX) return;
+    const old: { key: string; r: RunRecord }[] = [];
+    for (const [key, list] of this.history) for (const r of list) if (r.endedAt !== undefined && outputChars(r) > 0) old.push({ key, r });
+    old.sort((a, b) => a.r.endedAt! - b.r.endedAt! || a.r.startedAt - b.r.startedAt);
+    for (const { key, r } of old) {
+      if (this.historyChars <= (HISTORY_OUTPUT_MAX * 3) / 4) break;
+      const list = this.history.get(key)!;
+      list.splice(list.indexOf(r), 1);
+      if (!list.length) this.history.delete(key);
+      this.historyChars -= outputChars(r);
+    }
+  }
+
+  /**
+   * The button's `timeoutMs` changed while `run` goes on: its limit is now `timeoutMs` from its
+   * start, re-armed for what is left of it; a run already past it times out now. A run on its way
+   * out (cancelled, stopped) keeps going down.
+   */
+  private retime(run: LiveRun, timeoutMs: number) {
+    if (run.none || run.stopReason !== undefined) return;
+    const before = run.timeoutMs;
+    run.timeoutMs = timeoutMs;
+    const elapsed = this.clock() - run.t0;
+    const left = Math.round(timeoutMs - elapsed);
+    this.log(
+      left > 0
+        ? `${run.key} #${run.runId}: time limit ${duration(before)} → ${duration(timeoutMs)} while it runs (${duration(left)} left)`
+        : `${run.key} #${run.runId}: time limit ${duration(before)} → ${duration(timeoutMs)}, and it has run ${duration(Math.round(elapsed))}: stopping it`,
+    );
+    run.handle.retime?.(left);
+  }
+
+  private startRun(slot: Slot, runId: number) {
+    const b = slot.button;
+    const startedAt = slot.state.phase === 'running' ? slot.state.startedAt : this.now();
+    // Before its own action starts.
+    const stopped = stopsAny(b) ? this.stopOthers(slot) : 0;
+    const record: RunRecord = { runId, pad: slot.pad, button: b.id, startedAt, stdout: '', stderr: '' };
+    this.addRecord(slot.key, record);
+
+    let run: LiveRun | undefined;
+    const hooks: RunHooks = {
+      onUpdate: (u) => run && this.update(slot, run, u),
+      onExit: (o) => run && this.finishRun(slot, run, o),
+    };
+    // Action `none`: what it did was stop the others ("Done" for one that names nothing to stop).
+    const handle =
+      b.action.type === 'none'
+        ? finishedRun({ text: stopped ? `Stopped ${stopped}` : stopsAny(b) ? NOTHING_RUNNING : 'Done' }, hooks)
+        : this.spawn(
+            {
+              action: b.action,
+              baseDir: this.opts.baseDir,
+              timeoutMs: b.timeoutMs,
+              env: { BUTTPAD_PAD: slot.pad, BUTTPAD_BUTTON: b.id, BUTTPAD_RUN_ID: String(runId), BUTTPAD_LABEL: b.label },
+              key: slot.key,
+            },
+            hooks,
+          );
+    run = { runId, key: slot.key, handle, record, t0: this.clock(), timeoutMs: b.timeoutMs, none: b.action.type === 'none' };
+    if (handle.command !== undefined) record.command = handle.command;
+    if (handle.cwd !== undefined) record.cwd = handle.cwd;
+    slot.run = run;
+    this.live.add(run);
+    if (this.persist && handle.pid !== undefined) this.track(run, handle.pid);
+    this.opts.onRunStart?.(slot.key, runId, b);
+  }
+
+  /** List a spawned run in buttpad.state.json, with what a restarted host needs to find it again. */
+  private track(run: LiveRun, pid: number) {
+    const entry: LiveEntry = { key: run.key, runId: run.runId, pid, pgid: pid, startedAt: run.record.startedAt };
+    if (run.record.command !== undefined) entry.command = run.record.command;
+    if (run.record.cwd !== undefined) entry.cwd = run.record.cwd;
+    const fp = process.platform === 'linux' ? processFingerprint(pid) : undefined;
+    if (fp) entry.fingerprint = fp;
+    else
+      void processFingerprintAsync(pid).then((f) => {
+        if (!f || !this.liveEntries.has(entry)) return;
+        entry.fingerprint = f;
+        this.persist?.request(true);
+      });
+    run.entry = entry;
+    this.liveEntries.add(entry);
+    this.persist?.request(true);
+  }
+
+  private update(slot: Slot, run: LiveRun, u: RunUpdate) {
+    if (this.slots.get(slot.key) !== slot) return; // button was removed
+    if (u.latched !== undefined) this.setLatched(slot.key, u.latched);
+    // `@state:<pad>/<button>`: another button's chip ("All off" clearing each light's "ON 80%").
+    for (const [key, text] of u.latchedFor ?? []) {
+      if (this.slots.has(key)) this.setLatched(key, text);
+      else this.unknownLatched.note(`${slot.key} #${run.runId}: "@state:${key}" names no button in the config; ignored`);
+    }
+    if (u.progress !== undefined || u.status !== undefined) this.dispatch(slot, { type: 'progress', runId: run.runId, progress: u.progress, status: u.status });
+  }
+
+  private setLatched(key: string, text: string | null) {
+    const t = text ? clip(sanitize(text), LATCHED_MAX) : '';
+    const m = this.memo(key);
+    if ((m.latched ?? '') === t) return;
+    if (t) m.latched = t;
+    else delete m.latched;
+    this.opts.onLatched?.(key, t || null);
+    this.persist?.request();
+  }
+
+  private finishRun(slot: Slot, run: LiveRun, o: RunOutcome) {
+    const s = slot.state;
+    const cancelling = s.phase === 'running' && s.runId === run.runId && !!s.cancelling;
+    const shutdownKill = this.closed && run.stopReason === STOP_REASONS.shutdown;
+    const rec = run.record;
+    rec.endedAt = this.now();
+    rec.exitCode = o.exitCode;
+    rec.reason = shutdownKill ? 'interrupted' : run.stopReason || run.orphaned || cancelling ? 'cancelled' : (o.reason ?? 'exit');
+    const error =
+      run.stopReason ?? (o.reason === 'timeout' ? `timed out after ${duration(run.timeoutMs)}` : o.reason === 'spawn' ? (o.error ?? o.text) : undefined);
+    // A stop reason names a label, a spawn error a path from the config: display text, like the result.
+    if (error !== undefined) rec.error = sanitize(error);
+    const before = outputChars(rec);
+    rec.stdout = o.stdout;
+    rec.stderr = o.stderr;
+    this.grewRecord(run.key, rec, before);
+    this.runsFile?.request();
+    this.live.delete(run);
+    if (run.handle.dying()) this.dying.add(run);
+    if (slot.run === run) slot.run = undefined;
+    const text = run.stopText ?? o.text;
+    const exit: MachineEvent = { type: 'exit', runId: run.runId, now: rec.endedAt, exitCode: o.exitCode, text, reason: o.reason };
+    if (run.entry) {
+      if (shutdownKill) {
+        // Stays listed: the next host reports it as interrupted.
+        run.entry.stopped = 'shutdown';
+        run.entry.endedAt = rec.endedAt;
+      } else {
+        this.liveEntries.delete(run.entry);
+        // Ended on its own while the host shut down: remember how, as the machine would have shown it.
+        if (this.closed && this.slots.get(slot.key) === slot) this.remember(slot.key, transition(s, exit, this.machineOpts(slot))[0]);
+      }
+      this.persist?.request(true);
+    }
+    this.opts.onRunEnd?.(run.key, rec, o, { stopSource: run.stopSource });
+    if (this.closed) return;
+    this.dispatch(slot, exit);
+  }
+
+  private removeSlot(slot: Slot) {
+    clearTimeout(slot.resetTimer);
+    clearTimeout(slot.requeueTimer);
+    this.slots.delete(slot.key);
+    const run = slot.run;
+    if (run && this.stop(run, run.runId, { reason: STOP_REASONS.removed })) run.orphaned = true;
+    // A button that's gone has no device state to show.
+    const m = this.memos.get(slot.key);
+    if (m?.latched) {
+      delete m.latched;
+      this.opts.onLatched?.(slot.key, null);
+      this.persist?.request();
+    }
+  }
+
+  /** Read buttpad.state.json (at construction). */
+  private load(path: string) {
+    const clean = (s: string, max: number) => clip(sanitize(s), max);
+    const r = loadState(path, clean);
+    this.hostId = { pid: process.pid, fingerprint: processFingerprint(process.pid) };
+    if (!r.ok) {
+      this.loadNotes.push(r.missing ? `state: no ${path} yet; starting fresh` : `state: can't use ${path} (${r.error}); starting fresh`);
+    } else {
+      for (const [key, memo] of Object.entries(r.state.buttons)) this.memos.set(key, memo);
+      // Ids continue past every run it knew, finished or not.
+      for (const e of r.state.live) {
+        const m = this.memo(e.key);
+        m.lastRunId = Math.max(m.lastRunId, e.runId);
+      }
+      const prev = r.state.host;
+      // Another host that is still running wrote it (two hosts on one config): its runs are its own.
+      if (prev && prev.pid !== process.pid && prev.fingerprint && processFingerprint(prev.pid) === prev.fingerprint) {
+        this.loadNotes.push(`state: ${path} belongs to another ButtPad host that is still running (pid ${prev.pid}); this one won't save run state or touch that host's actions`);
+        return;
+      }
+      if (r.notPrivate) {
+        // Someone else could have written it, and a fingerprint is no secret (/proc): its runs in
+        // flight are reported, never signalled. Run ids, results and latched states are display
+        // data (checked and sanitized), so they're kept. The fingerprints go, so these entries stay
+        // inert even once saved again (a save before recover() keeps them listed).
+        if (r.state.live.some((e) => e.fingerprint && e.stopped !== 'shutdown'))
+          this.loadNotes.push(`state: ${path} is not private (${r.notPrivate}): someone else could have written it, so the runs it lists as still running are left alone`);
+        for (const e of r.state.live) delete e.fingerprint;
+        this.recoverUntrusted = true;
+      }
+      this.toRecover = r.state.live;
+    }
+    this.persist = new StateFile(path, () => this.snapshot(), { log: (m) => this.log(m), write: this.opts.stateWrite, clock: this.clock });
+    this.loadRuns(this.opts.runsPath ?? runsPathFor(path), clean);
+  }
+
+  /**
+   * Read the run log a previous host saved (buttpad.runs.json): the runs of the buttons still in the
+   * config come back (setConfig drops the rest). Display data, checked and capped like the state
+   * file's; a file someone else could have written is used too, and written back 0600 right away.
+   * A missing file is the usual first start: nothing to say.
+   */
+  private loadRuns(path: string, clean: (s: string, max: number) => string) {
+    const r = loadRuns(path, clean);
+    if (r.ok) {
+      for (const [key, list] of Object.entries(r.runs.runs)) {
+        this.history.set(key, list);
+        for (const rec of list) this.historyChars += outputChars(rec);
+      }
+      this.capHistory();
+    } else if (!r.missing) this.loadNotes.push(`runs: can't use ${path} (${r.error}); the run log starts empty`);
+    this.runsFile = new StateFile(path, () => runsFileText(this.history, this.now()), {
+      log: (m) => this.log(m),
+      write: this.opts.runsWrite,
+      clock: this.clock,
+      intervalMs: RUNS_SAVE_INTERVAL_MS,
+      urgentIntervalMs: RUNS_SAVE_INTERVAL_MS,
+      name: 'runs',
+      stake: "the run log won't survive a restart",
+    });
+    if (r.ok && r.notPrivate) this.runsFile.request();
+  }
+
+  private snapshot(): PersistedState {
+    const buttons: Record<string, ButtonMemo> = {};
+    for (const [key, m] of this.memos) {
+      const memo: ButtonMemo = { lastRunId: m.lastRunId };
+      if (m.last) memo.last = m.last;
+      if (m.latched) memo.latched = m.latched;
+      buttons[key] = memo;
+    }
+    // Leftovers not yet recovered stay listed, so a crash before recover() loses nothing.
+    return { version: 1, savedAt: this.now(), host: this.hostId, buttons, live: [...this.toRecover, ...this.liveEntries] };
+  }
+}
+
+/**
+ * One host log line for a finished run. What's in it comes from the config (labels in stop reasons,
+ * paths in spawn errors) and from the run (its result text): sanitized, one line, no escape sequences.
+ */
+export function runEndLine(key: string, rec: RunRecord, o: RunOutcome, stopSource?: string): string {
+  return sanitize(runEndText(key, rec, o, stopSource));
+}
+
+function runEndText(key: string, rec: RunRecord, o: RunOutcome, stopSource?: string): string {
+  const secs = `${(o.durationMs / 1000).toFixed(1)}s`;
+  const text = o.text && rec.reason !== 'spawn' ? `: ${o.text}` : '';
+  const head = `${key} #${rec.runId} ${secs}`;
+  switch (rec.reason) {
+    case 'exit':
+      return o.exitCode === 0 ? `✓ ${head}${text}` : `✗ ${head} exit ${o.exitCode ?? o.signal}${text}`;
+    case 'spawn':
+      return `✗ ${head} could not start: ${rec.error ?? o.text ?? 'spawn failed'}`;
+    case 'timeout':
+      return `✗ ${head} ${rec.error ?? 'timed out'}${text}`;
+    default:
+      return `■ ${head} ${rec.error ?? rec.reason}${rec.error === STOP_REASONS.device && stopSource ? ` (${stopSource})` : ''}${text}`;
+  }
+}

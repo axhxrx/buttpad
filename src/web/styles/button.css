@@ -1,0 +1,1502 @@
+/*
+ * Button faces. Every state differs in color AND motion AND shape (see docs/DESIGN.md):
+ *   READY       solid color, huge label, still; how the last run ended in the corner
+ *   ARMING      ink fill rising bottom→top with a hard leading edge; pop + flash on fire
+ *   CONFIRM     face dimmed, thick amber frame blinking 2 Hz, "… AGAIN TO CONFIRM", amber countdown
+ *   SENDING     dimmed, three pulsing dots
+ *   RUNNING     diagonal stripes scrolling; label big, elapsed clock under it; or a left→right
+ *               fill with the %, slow stripes still moving underneath
+ *   SUCCESS     green flood from the center, giant ✓ popping in, then still; drain bar
+ *   FAILURE     red flood with thin cross-hatching, ✗ shaking in, the reason in big type, slow
+ *               dark pulse; this device's own stays until its next run (a press retries; ✕ clears)
+ *   STOPPED     slate flood, ■, still: stopped on purpose, not a failure
+ *   UNKNOWN     amber flood, "?", dashed frame: NO RESPONSE / IT RAN
+ *   INTERRUPTED amber flood with dark hazard stripes, lightning glyph, pulse
+ *   OFFLINE     grey, dashed border, ⚠, dim label; shakes when pressed
+ *   SYNCING     dimmed, still, "SYNCING…": back from a long stretch away, until the host's word is in
+ * Show mode (data-show, a dark house): faces dimmed to their hue; results as an edge + glyph + text.
+ * Only transform/opacity animate. Sizes come from container query units of .bp-btn.
+ */
+
+.bp-btn {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  container-type: size;
+  touch-action: none;
+  cursor: pointer;
+  outline: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* Run mode: each button also takes the half of the grid gap next to it, so no touch lands on
+   nothing. (Not in the editor, whose canvas has its own hit areas.) */
+.bp-grid[data-run] > .bp-btn::before {
+  content: '';
+  position: absolute;
+  inset: calc(var(--gap) / -2);
+}
+
+.bp-face {
+  --pad: max(8px, 6cqmin);
+  --top-fs: clamp(10px, 4.6cqmin, 20px);
+  --top-h: 0px;
+  /* A result's bottom pill (TAP TO RETRY, NEXT RUN QUEUED): its font, and the row kept for it. */
+  --foot-fs: clamp(9px, 5.2cqmin, 22px);
+  --foot-h: 0px;
+  --iw: calc(100cqw - 2 * var(--pad));
+  --ih: calc(100cqh - 2 * var(--pad) - var(--top-h) - var(--foot-h));
+  --radius: clamp(10px, 7cqmin, 30px);
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+  isolation: isolate;
+  color: var(--ink);
+  font-family: var(--font);
+  transform: translateZ(0);
+  transition: transform 90ms ease-out;
+}
+.bp-face.is-pressed {
+  transform: scale(0.965);
+}
+
+.bp-base,
+.bp-stripes,
+.bp-prog,
+.bp-pulse,
+.bp-arm,
+.bp-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.bp-base {
+  background-color: var(--bg);
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.18) 0%, rgb(255 255 255 / 0) 42%, rgb(0 0 0 / 0) 60%, rgb(0 0 0 / 0.16) 100%);
+  box-shadow:
+    inset 0 1.5px 0 rgb(255 255 255 / 0.28),
+    inset 0 calc(-1 * max(3px, 1.2cqmin)) 0 rgb(0 0 0 / 0.22);
+}
+.is-pressed .bp-base {
+  filter: brightness(0.82);
+}
+
+/* ARMING: full-size layer translated up; the edge stays crisp at any fill level. (Tints use
+   opacity rather than color-mix() so they work on older engines too.) */
+.bp-arm {
+  transform: translateY(100%);
+  will-change: transform;
+}
+.bp-arm::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  opacity: 0.34;
+}
+.bp-arm::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: max(4px, 2.2cqh);
+  background: var(--ink);
+}
+.bp-flash {
+  background: #fff;
+  opacity: 0;
+}
+
+/* ---- content ------------------------------------------------------------------------------ */
+
+.bp-content {
+  position: absolute;
+  inset: calc(var(--pad) + var(--top-h)) var(--pad) var(--pad);
+  z-index: 2;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2.6cqh;
+  text-align: center;
+  color: var(--ink);
+}
+/* Fitted text breaks only where lib/fit.ts measured it may: at its spaces and <wbr>s (keep-all:
+   no breaks between CJK characters otherwise). anywhere stays as the emergency exit. */
+.bp-label,
+.bp-head,
+.bp-headline {
+  flex: none;
+  width: 100%;
+  font-weight: 900;
+  line-height: 1.04;
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  --fit-w: var(--iw);
+  --fit-h: calc(var(--ih) * 0.6);
+  --fit-max: 44cqh;
+}
+@supports (word-break: auto-phrase) {
+  :is(.bp-label, .bp-head, .bp-sub):lang(ja) {
+    word-break: auto-phrase;
+  }
+}
+/* RUNNING's clock / %: secondary to the label (what is running matters more than for how long). */
+.bp-num {
+  flex: none;
+  font-weight: 900;
+  line-height: 0.92;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  opacity: 0.92;
+  --line-max: min(calc(var(--ih) * 0.2), 64px);
+}
+/* Status / result text: fit to two lines; below --fit-min it clamps with an ellipsis instead. */
+.bp-sub {
+  flex: none;
+  width: 100%;
+  font-weight: 700;
+  line-height: 1.08;
+  text-wrap: balance;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  --fit-w: var(--iw);
+  --fit-h: calc(var(--ih) * 0.17);
+  --fit-max: min(8cqh, 40px);
+  --fit-min: 10px;
+}
+/* A result's headline (the reason: ≤ 2 lines, big) and its small print (EXIT 3, stopped by…). */
+.bp-headline {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  --fit-h: calc(var(--ih) * 0.3);
+  --fit-max: 15cqh;
+  --fit-min: min(12px, 8cqh);
+}
+.bp-sub.bp-detail {
+  opacity: 0.85;
+  letter-spacing: 0.02em;
+  --fit-h: calc(var(--ih) * 0.13);
+  --fit-max: min(6.4cqh, 28px);
+}
+/* The glyph is the flexible part: it shrinks first when a small button runs out of room. */
+.bp-icon {
+  flex: 0 1 min(44cqh, 62cqw);
+  min-height: 8cqh;
+  width: 100%;
+  margin: -3cqh 0;
+}
+.bp-time {
+  position: absolute;
+  right: 0;
+  bottom: -0.2em;
+  font-weight: 700;
+  font-size: clamp(10px, 4.6cqmin, 22px);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+/* READY hints: trigger + key chips along the bottom edge. They shrink (the trigger chip first,
+   down to its icon) rather than spill out of a narrow button. */
+.bp-hints {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -0.25em;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 6px;
+  font-weight: 900;
+  font-size: clamp(10px, 5.4cqmin, 24px);
+  letter-spacing: 0.08em;
+  line-height: 1;
+  pointer-events: none;
+}
+.bp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  padding: 0.38em 0.7em 0.38em 0.5em;
+  border-radius: 99px;
+  background: rgb(128 128 128 / 0.3);
+  background: color-mix(in srgb, var(--ink) 16%, transparent);
+  white-space: nowrap;
+}
+.bp-chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bp-trigger {
+  flex: 0 1 auto;
+}
+.bp-key {
+  flex: none;
+  max-width: 60%;
+}
+.bp-chip svg {
+  flex: none;
+  width: 1.2em;
+  height: 1.2em;
+}
+/* Narrow: tighter chips; the key chip drops its keyboard glyph (a chip with a key name reads as a
+   key), and HOLD 1.5s keeps the duration (the icon says hold). */
+@container (max-width: 180px) {
+  .bp-hints {
+    gap: 4px;
+    letter-spacing: 0.03em;
+  }
+  .bp-chip {
+    gap: 0.3em;
+    padding: 0.38em 0.5em 0.38em 0.4em;
+  }
+  .bp-key svg,
+  .bp-trigger.has-extra .bp-chip-word,
+  .bp-hints:has(.bp-key) .bp-trigger.is-double .bp-chip-word {
+    display: none;
+  }
+}
+/* "12 s ago", or "12s" where that doesn't fit. */
+.bp-short {
+  display: none;
+}
+@container (max-width: 200px) {
+  .bp-btn:has(.bp-latched) .bp-last .bp-long {
+    display: none;
+  }
+  .bp-btn:has(.bp-latched) .bp-last .bp-short {
+    display: inline;
+  }
+}
+.bp-chip svg + svg {
+  margin-left: 0.15em;
+}
+.bp-key {
+  padding-left: 0.55em;
+}
+
+/* Small buttons: drop the extras, keep the label. */
+@container (max-height: 130px) {
+  .bp-hints,
+  .bp-time {
+    display: none;
+  }
+}
+/* Narrow ones (4 columns on a phone: ~90 px) keep what is about safety, as glyphs: how to press it
+   (hold / tap / double, and a hold's duration) and the confirm lock. The key chip goes. */
+@container (max-width: 110px) {
+  .bp-time,
+  .bp-key,
+  .bp-trigger .bp-chip-word {
+    display: none;
+  }
+  .bp-hints {
+    justify-content: center;
+    letter-spacing: 0.02em;
+  }
+  .bp-chip.bp-trigger {
+    gap: 0.2em;
+    padding: 0.3em 0.45em;
+  }
+  .bp-trigger svg {
+    width: 1.45em;
+    height: 1.45em;
+  }
+}
+@container (max-height: 170px) {
+  .bp-sub {
+    -webkit-line-clamp: 1;
+  }
+}
+@container (max-height: 95px) {
+  .bp-sub {
+    display: none;
+  }
+}
+
+/* ---- READY / ARMING ------------------------------------------------------------------- */
+
+.bp-btn[data-visual='ready'] .bp-label,
+.bp-btn[data-visual='arming'] .bp-label {
+  animation: bp-settle 0.28s ease-out both;
+}
+@container (min-height: 131px) {
+  .bp-btn[data-visual='ready'] .bp-content,
+  .bp-btn[data-visual='arming'] .bp-content {
+    padding-bottom: 1.4em;
+  }
+}
+
+/* ---- CONFIRM -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='confirm'] .bp-face {
+  --ink: #fff;
+}
+.bp-btn[data-visual='confirm'] .bp-base {
+  filter: brightness(0.42) saturate(0.85);
+}
+.bp-btn[data-visual='confirm'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.2);
+  --fit-max: 16cqh;
+  opacity: 0.85;
+}
+.bp-btn[data-visual='confirm'] .bp-head {
+  color: var(--amber);
+  --fit-h: calc(var(--ih) * 0.46);
+  --fit-max: 22cqh;
+  animation: bp-nudge 1s ease-in-out infinite;
+}
+.bp-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.bp-btn[data-visual='confirm'] .bp-frame {
+  border: max(6px, 4cqmin) solid var(--amber);
+  animation: bp-blink 0.5s steps(1, end) infinite;
+}
+
+/* ---- SENDING -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='sending'] .bp-base {
+  filter: brightness(0.7);
+}
+.bp-btn[data-visual='sending'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.42);
+}
+.bp-dots {
+  display: flex;
+  gap: 3.4cqmin;
+}
+.bp-dots i {
+  width: 6cqmin;
+  height: 6cqmin;
+  border-radius: 50%;
+  background: currentColor;
+  animation: bp-dot 0.8s ease-in-out infinite;
+}
+.bp-dots i:nth-child(2) {
+  animation-delay: 0.13s;
+}
+.bp-dots i:nth-child(3) {
+  animation-delay: 0.26s;
+}
+
+/* ---- RUNNING -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='running'] .bp-base {
+  filter: brightness(0.86);
+}
+/* What is running stays the headline; the clock comes second (it is capped at 90% of the label's
+   size: it carries the label's fit variables for that). Never below a readable size. */
+.bp-btn[data-visual='running'] :is(.bp-label, .bp-num) {
+  --fit-w: var(--iw);
+  --fit-h: calc(var(--ih) * 0.4);
+  --fit-max: 30cqh;
+  --fit-min: min(16px, 9cqh);
+}
+.bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-label {
+  --fit-h: calc(var(--ih) * 0.17);
+  --fit-max: 13cqh;
+  --fit-min: min(13px, 8cqh);
+}
+.bp-stripes {
+  --sw: clamp(10px, 8cqmin, 48px);
+  --sp: calc(var(--sw) * 2.8284);
+  left: calc(-1 * var(--sp));
+  right: auto;
+  width: calc(100% + 2 * var(--sp));
+  background: repeating-linear-gradient(-45deg, transparent 0 var(--sw), var(--ink) var(--sw) calc(var(--sw) * 2));
+  opacity: 0.26;
+  animation:
+    bp-stripes 0.75s linear infinite,
+    bp-fade 0.3s ease-out;
+  will-change: transform;
+}
+/* Under a progress fill: fainter and slower, but moving, so 2% still reads as busy. */
+.bp-stripes.is-under {
+  opacity: 0.13;
+  animation:
+    bp-stripes 2.4s linear infinite,
+    bp-fade 0.3s ease-out;
+}
+.bp-prog {
+  --p: 0;
+  transform: translateX(calc((var(--p) - 1) * 100%));
+  transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.bp-prog::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  opacity: 0.3;
+}
+.bp-prog::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: max(3px, 1.3cqw);
+  background: var(--ink);
+  opacity: 0.55;
+}
+.bp-pill {
+  flex: none;
+  max-width: 100%;
+  --line-max: min(6.6cqh, 30px);
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  line-height: 1;
+  padding: 0.5em 0.95em;
+  border-radius: 99px;
+  background: var(--ink);
+  color: var(--bg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bp-pill.is-cancelling,
+.bp-pill.bp-again {
+  animation: bp-blink 0.6s steps(1, end) infinite;
+}
+.bp-btn[data-visual='running'] .bp-dots {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+.bp-btn[data-visual='running'] .bp-dots i {
+  width: 3.6cqmin;
+  height: 3.6cqmin;
+}
+
+/* ---- results: SUCCESS / FAILURE / STOPPED / UNKNOWN / INTERRUPTED ------------------------ */
+
+.bp-btn[data-visual='success'] .bp-face {
+  --ink: var(--ok-ink);
+  --flood: var(--ok);
+}
+.bp-btn[data-visual='failure'] .bp-face {
+  --ink: var(--bad-ink);
+  --flood: var(--bad);
+}
+.bp-btn[data-visual='stopped'] .bp-face {
+  --ink: var(--stop-ink);
+  --flood: var(--stop);
+}
+.bp-btn:is([data-visual='unknown'], [data-visual='interrupted']) .bp-face {
+  --ink: var(--warn-ink);
+  --flood: var(--amber);
+}
+.bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-base {
+  background: var(--flood);
+  box-shadow: none;
+}
+/* INTERRUPTED: hazard stripes, still. */
+.bp-btn[data-visual='interrupted'] .bp-base {
+  background: repeating-linear-gradient(-45deg, rgb(0 0 0 / 0.16) 0 max(10px, 6cqmin), transparent 0 max(20px, 12cqmin)), var(--flood);
+}
+/* UNKNOWN: a dashed frame (we don't know how it went). */
+.bp-btn[data-visual='unknown'] .bp-frame {
+  border: max(3px, 1.8cqmin) dashed var(--warn-ink);
+  opacity: 0.55;
+}
+.bp-flood {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 150cqmax;
+  height: 150cqmax;
+  margin: -75cqmax 0 0 -75cqmax;
+  border-radius: 50%;
+  background: var(--flood);
+  pointer-events: none;
+  animation: bp-flood 0.42s cubic-bezier(0.15, 0.85, 0.3, 1) both;
+}
+.bp-btn[data-visual='interrupted'] .bp-flood {
+  background: transparent;
+}
+.bp-btn[data-visual='success'] .bp-icon {
+  animation: bp-pop-in 0.5s cubic-bezier(0.2, 1.5, 0.4, 1) 0.1s both;
+}
+.bp-btn:is([data-visual='failure'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
+  animation: bp-shake-in 0.55s ease-out 0.08s both;
+}
+/* A failure's glyph gives the room to its reason. */
+.bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
+  flex-basis: min(26cqh, 44cqw);
+  min-height: 7cqh;
+  margin: -1.5cqh 0;
+}
+.bp-pulse {
+  background: #000;
+  opacity: 0;
+  animation: bp-pulse 1.6s ease-in-out 0.5s infinite;
+}
+/* FAILURE's texture: thin cross-hatching (✗✗✗), still. A failure isn't "just red" next to a red
+   E-STOP, in grayscale too; RUNNING's stripes are wide and move, INTERRUPTED's are wide hazard
+   bands. Comes in after the flood. */
+.bp-hatch {
+  --hw: max(2px, 0.9cqmin);
+  --hs: max(11px, 6.4cqmin);
+  --hc: rgb(0 0 0 / 0.32);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(45deg, transparent 0 calc(var(--hs) - var(--hw)), var(--hc) 0 var(--hs)),
+    repeating-linear-gradient(-45deg, transparent 0 calc(var(--hs) - var(--hw)), var(--hc) 0 var(--hs));
+  animation: bp-fade 0.45s ease-out 0.2s both;
+}
+/* Under the OFFLINE look ("LAST RUN: EXIT 3"): the same texture, in the failure red, faint. */
+.bp-btn[data-visual='offline'] .bp-hatch {
+  --hc: rgb(227 38 43 / 0.3);
+  animation: none;
+}
+.bp-drain {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  height: max(5px, 2.6cqmin);
+  background: var(--ink);
+  opacity: 0.6;
+  transform-origin: 0 50%;
+  animation-name: bp-drain;
+  animation-timing-function: linear;
+  animation-fill-mode: both;
+  pointer-events: none;
+}
+.bp-drain-confirm {
+  background: var(--amber);
+  opacity: 1;
+  height: max(6px, 3cqmin);
+}
+/* Bottom-edge notes of a result: stays until touched, a queued re-run coming up. They sit in a row
+   of their own (--foot-h, taken out of --ih like the top band's), so the fitted text above is sized
+   for the room that is left and is never printed over (QA: "EXIT 3" under TAP TO RETRY on 122 px
+   buttons). */
+.bp-btn.has-foot .bp-face {
+  --foot-h: calc(var(--foot-fs) * 1.95);
+}
+.bp-btn.has-foot .bp-content {
+  padding-bottom: var(--foot-h);
+}
+.bp-sticky,
+.bp-next {
+  position: absolute;
+  left: 50%;
+  bottom: -0.1em;
+  translate: -50% 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0.32em 0.7em;
+  border-radius: 99px;
+  font-weight: 900;
+  font-size: var(--foot-fs);
+  letter-spacing: 0.05em;
+  line-height: 1;
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+}
+.bp-next {
+  background: var(--ink);
+  color: var(--flood);
+}
+
+/* ---- OFFLINE -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='offline'] .bp-face {
+  --ink: var(--off-ink);
+}
+.bp-btn[data-visual='offline'] .bp-base {
+  background: var(--off-bg);
+  box-shadow: none;
+}
+.bp-btn[data-visual='offline'] .bp-frame {
+  border: max(3px, 1.6cqmin) dashed var(--off-line);
+}
+.bp-btn[data-visual='offline'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.3);
+  --fit-max: 22cqh;
+  opacity: 0.6;
+}
+.bp-btn[data-visual='offline'] .bp-icon {
+  flex-basis: min(24cqh, 28cqw);
+  margin: 0;
+  color: var(--amber);
+}
+.bp-offline-tag {
+  font-size: clamp(10px, min(6cqh, 5.4cqw), 26px);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  opacity: 0.85;
+}
+/* What the host was last seen doing, under the OFFLINE look: its layer dimmed and still, one line. */
+.bp-btn[data-visual='offline'] .bp-stripes {
+  opacity: 0.12;
+  animation: none;
+}
+.bp-btn[data-visual='offline'] .bp-prog::before {
+  opacity: 0.16;
+}
+.bp-btn[data-visual='offline'] .bp-prog::after {
+  opacity: 0.3;
+}
+.bp-tint {
+  position: absolute;
+  inset: 0;
+  opacity: 0.2;
+  pointer-events: none;
+}
+.bp-tint.is-success {
+  background: var(--ok);
+}
+.bp-tint.is-failure {
+  background: var(--bad);
+}
+.bp-tint.is-stopped {
+  background: var(--stop);
+}
+.bp-tint:is(.is-unknown, .is-interrupted) {
+  background: var(--amber);
+}
+.bp-sub.bp-offline-was {
+  display: block;
+  width: auto;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  opacity: 0.75;
+  --line-max: clamp(10px, min(5cqh, 4.6cqw), 22px);
+}
+
+/* ---- SYNCING: back from a long stretch away, the host's current word not in yet -------- */
+
+/* Still and dimmed: neither the minutes-old picture nor the backlog the socket replays is news. */
+.bp-btn[data-visual='syncing'] .bp-face {
+  --ink: #e6e9ee;
+}
+.bp-btn[data-visual='syncing'] .bp-base {
+  filter: brightness(0.45) saturate(0.6);
+  box-shadow: none;
+}
+.bp-btn[data-visual='syncing'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.34);
+  --fit-max: 22cqh;
+  opacity: 0.7;
+}
+.bp-btn[data-visual='syncing'] .bp-latched {
+  opacity: 0.5;
+}
+.bp-syncing-tag {
+  font-size: clamp(10px, min(5.4cqh, 5cqw), 22px);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  opacity: 0.75;
+}
+
+/* ---- the top edge: the last result / another device's run (left), latched state (right) -- */
+
+.bp-btn.has-top .bp-face {
+  --top-h: calc(var(--top-fs) * 1.75);
+}
+.bp-top {
+  position: absolute;
+  z-index: 3;
+  top: calc(var(--pad) * 0.7);
+  left: calc(var(--pad) * 0.7);
+  right: calc(var(--pad) * 0.7);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-weight: 900;
+  font-size: var(--top-fs);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  color: var(--ink);
+  pointer-events: none;
+}
+.bp-mark {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  padding: 0.22em 0.6em 0.22em 0.22em;
+  border-radius: 99px;
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.bp-last i {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.3em;
+  height: 1.3em;
+  border-radius: 50%;
+  font-style: normal;
+  font-size: 0.95em;
+}
+.bp-last.is-ok i {
+  background: var(--ok);
+  color: var(--ok-ink);
+}
+.bp-last.is-bad i {
+  background: var(--bad);
+  color: var(--bad-ink);
+}
+.bp-last.is-stopped i {
+  background: var(--stop);
+  color: var(--stop-ink);
+}
+.bp-last.is-warn i {
+  background: var(--amber);
+  color: var(--warn-ink);
+}
+/* "✓ printing 37% · 3 s ago": the result text, whole or not at all. --need (ButtonFace) is the
+   mark's width with it (and the latched chip beside it), in em of this font; where the band is
+   narrower, max-width comes out 0 and only "3 s ago" shows. */
+.bp-last-text {
+  display: inline-block;
+  vertical-align: top;
+  overflow: hidden;
+  white-space: pre;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  max-width: clamp(0px, (100cqw - 1.4 * var(--pad) - var(--top-fs) * var(--need, 99)) * 999, 100cqw);
+}
+.bp-other {
+  padding-left: 0.5em;
+  background: transparent;
+  box-shadow: inset 0 0 0 0.14em color-mix(in srgb, var(--ink) 55%, transparent);
+}
+.bp-other svg {
+  flex: none;
+  width: 1.15em;
+  height: 1.15em;
+}
+/* A result kept on screen: its ✕ clears it without a press (a press on the face is a retry). */
+.bp-dismiss {
+  position: relative;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.9em;
+  height: 1.9em;
+  margin: -0.15em 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  font: inherit;
+  font-size: 1.05em;
+  line-height: 1;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 20%, transparent);
+  box-shadow: inset 0 0 0 0.12em color-mix(in srgb, var(--ink) 45%, transparent);
+  pointer-events: auto;
+  cursor: pointer;
+}
+/* A finger-sized target around the small chip. */
+.bp-dismiss::after {
+  content: '';
+  position: absolute;
+  inset: -10px;
+}
+/* Device state reported by the action (`@state`): solid, it matters (the corner mark yields first). */
+.bp-latched {
+  flex: none;
+  min-width: 0;
+  margin-left: auto;
+  max-width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0.3em 0.7em;
+  border-radius: 99px;
+  background: var(--ink);
+  color: var(--bg);
+  letter-spacing: 0.05em;
+}
+.bp-btn[data-visual='offline'] .bp-latched {
+  opacity: 0.6;
+}
+/* A latched state the host can't vouch for (a crash cut off the run that set it): hollow, dashed, "?". */
+.bp-latched.is-uncertain {
+  background: transparent;
+  color: var(--ink);
+  outline: 0.13em dashed currentColor;
+  outline-offset: -0.13em;
+  opacity: 0.85;
+}
+.bp-latched.is-uncertain i {
+  font-style: normal;
+  font-weight: 900;
+}
+@container (max-width: 112px) {
+  .bp-mark .bp-chip-text {
+    display: none;
+  }
+  .bp-mark {
+    padding-right: 0.22em;
+  }
+  .bp-other {
+    padding: 0.22em;
+  }
+}
+
+/* ---- wide buttons (desktop rows, landscape phones): glyph or number beside the text ---- */
+
+@container (min-aspect-ratio: 9 / 4) {
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline'], [data-visual='running'])
+    .bp-content {
+    --side: min(70cqh, 34cqw);
+    display: grid;
+    align-content: center;
+    justify-items: start;
+    column-gap: 6cqh;
+    row-gap: 2.4cqh;
+    text-align: left;
+  }
+  /* results / offline: [glyph | label, headline, text] */
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content {
+    grid-template-columns: var(--side) minmax(0, 1fr);
+  }
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content > * {
+    grid-column: 2;
+    --fit-w: calc(var(--iw) - var(--side) - 6cqh);
+  }
+  .bp-btn[data-visual] .bp-content > .bp-icon {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+    align-self: center;
+    width: var(--side);
+    height: var(--side);
+    margin: 0;
+  }
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-content > .bp-icon {
+    width: calc(var(--side) * 0.75);
+    height: calc(var(--side) * 0.75);
+    justify-self: center;
+  }
+  .bp-btn[data-visual='offline'] .bp-content > .bp-icon {
+    width: calc(var(--side) * 0.7);
+    height: calc(var(--side) * 0.7);
+    justify-self: center;
+  }
+  .bp-btn:is([data-visual='success'], [data-visual='offline']) .bp-label {
+    --fit-h: calc(var(--ih) * 0.26);
+    --fit-max: 26cqh;
+  }
+  /* A failure's reason is the biggest text on it; the label says which button, smaller. */
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-label {
+    --fit-h: calc(var(--ih) * 0.17);
+    --fit-max: 17cqh;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-headline {
+    --fit-h: calc(var(--ih) * 0.5);
+    --fit-max: 28cqh;
+  }
+  .bp-btn[data-visual='offline'] .bp-offline-was {
+    --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
+  }
+  .bp-btn[data-visual] .bp-content > .bp-sub {
+    --fit-h: calc(var(--ih) * 0.2);
+    --fit-max: 12cqh;
+  }
+  /* running: [label, status, pill | number] */
+  .bp-btn[data-visual='running'] .bp-content {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .bp-btn[data-visual='running'] .bp-content > * {
+    grid-column: 1;
+    --fit-w: calc(var(--iw) * 0.62);
+  }
+  .bp-btn[data-visual='running'] .bp-content > :is(.bp-label, .bp-num) {
+    --fit-w: calc(var(--iw) * 0.62);
+    --fit-h: calc(var(--ih) * 0.42);
+    --fit-max: 36cqh;
+  }
+  .bp-btn[data-visual='running'] .bp-content > .bp-num {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    align-self: center;
+    --fit-w: calc((100cqw - 2 * var(--pad)) * 0.62);
+    --iw: calc((100cqw - 2 * var(--pad)) * 0.32);
+    --line-max: calc(var(--ih) * 0.44);
+  }
+  .bp-btn[data-visual='running'] .bp-content > .bp-pill {
+    --iw: calc((100cqw - 2 * var(--pad)) * 0.6);
+  }
+}
+
+/* ---- short buttons (many rows, landscape): one centered row, only what fits ---------- */
+
+/* Every item gets a fixed share of the row as its width (--ic: glyph + gap, --nw: number/headline
+   + gap, the label the rest), and the font sizes are computed for those same widths: a label sized
+   for two lines is laid out on two, never squeezed onto one and clipped. */
+@container (max-height: 84px) {
+  .bp-btn.has-top .bp-face,
+  .bp-btn.has-foot .bp-face {
+    --top-h: 0px;
+    --foot-h: 0px;
+  }
+  .bp-btn.has-foot .bp-content {
+    padding-bottom: 0;
+  }
+  .bp-btn[data-visual] .bp-content {
+    --gapw: max(6px, 2.4cqw);
+    --icon: min(var(--ih), 14cqw);
+    --ic: 0px;
+    --nw: 0px;
+    --lw: 0px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: var(--gapw);
+    text-align: center;
+  }
+  /* The corner marks don't fit; latched state does, at the right end of the row. */
+  .bp-top > .bp-mark {
+    display: none;
+  }
+  .bp-top {
+    top: 50%;
+    translate: 0 -50%;
+    left: auto;
+    max-width: 30%;
+  }
+  .bp-btn:has(.bp-latched) .bp-content {
+    --lw: calc(var(--iw) * 0.3 + var(--gapw));
+    padding-right: var(--lw);
+  }
+  .bp-latched {
+    max-width: 100%;
+  }
+  .bp-btn[data-visual] .bp-content > :is(.bp-sub, .bp-pill, .bp-time, .bp-hints, .bp-dots, .bp-sticky, .bp-next) {
+    display: none;
+  }
+  .bp-btn[data-visual] .bp-content > :is(.bp-label, .bp-head) {
+    flex: none;
+    width: calc(var(--iw) - var(--ic) - var(--nw) - var(--lw));
+    min-width: 0;
+    --fit-w: calc(var(--iw) - var(--ic) - var(--nw) - var(--lw));
+    --fit-h: var(--ih);
+    --fit-max: var(--ih);
+    --fit-min: 0px;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-icon {
+    flex: none;
+    order: -1;
+    width: var(--icon);
+    height: var(--icon);
+    margin: 0;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-num {
+    flex: none;
+    max-width: calc(var(--nw) - var(--gapw));
+    --iw: calc(var(--nw) - var(--gapw));
+    --line-max: var(--ih);
+    /* One row: the clock has its own share; no cap by the label. */
+    --fit-min: 999px;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-headline {
+    flex: none;
+    width: calc(var(--nw) - var(--gapw));
+    --fit-w: calc(var(--nw) - var(--gapw));
+    --fit-h: var(--ih);
+    --fit-max: calc(var(--ih) * 0.6);
+    --fit-min: 0px;
+  }
+  .bp-btn[data-visual='confirm'] .bp-content > .bp-label {
+    display: none;
+  }
+  .bp-btn[data-visual='running'] .bp-content {
+    --nw: calc(var(--iw) * 0.3 + var(--gapw));
+  }
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content {
+    --ic: calc(var(--icon) + var(--gapw));
+  }
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-content {
+    --nw: calc(var(--iw) * 0.42 + var(--gapw));
+  }
+}
+/* Not wide enough for the glyph too: color and motion say the state, the words get the room. */
+@container (max-height: 84px) and (max-aspect-ratio: 16 / 5) {
+  .bp-btn[data-visual] .bp-content {
+    --ic: 0px !important;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-icon {
+    display: none;
+  }
+}
+/* Not even for the number/headline: the label alone. */
+@container (max-height: 84px) and (max-aspect-ratio: 12 / 5) {
+  .bp-btn[data-visual] .bp-content {
+    --nw: 0px !important;
+  }
+  .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-headline) {
+    display: none;
+  }
+}
+
+/* ---- double-tap pips, flash badges ----------------------------------------------------- */
+
+.bp-pips {
+  position: absolute;
+  top: var(--pad);
+  left: 50%;
+  z-index: 4;
+  display: flex;
+  gap: 2.6cqmin;
+  transform: translateX(-50%);
+}
+.bp-pips i {
+  width: 6cqmin;
+  height: 6cqmin;
+  border-radius: 50%;
+  border: max(2px, 1cqmin) solid var(--ink);
+}
+.bp-pips i:first-child {
+  background: var(--ink);
+}
+.bp-badge {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 5;
+  translate: -50% -50%;
+  padding: 0.22em 0.55em;
+  border-radius: 0.3em;
+  background: #0b0c0e;
+  color: #fff;
+  box-shadow: 0 0 0 0.07em #fff;
+  font-weight: 900;
+  /* The face sets the real size from the word's width; this is the fallback. */
+  font-size: clamp(16px, min(17cqh, 15cqw), 110px);
+  letter-spacing: 0.04em;
+  line-height: 1;
+  white-space: nowrap;
+  text-align: center;
+  animation: bp-badge 1.2s ease-out both;
+  pointer-events: none;
+}
+.bp-badge small {
+  display: block;
+  margin-top: 0.3em;
+  font-size: 0.42em;
+  letter-spacing: 0.12em;
+}
+/* Over a result: a small chip low on the face, so the result stays readable. */
+.bp-badge.is-small {
+  top: auto;
+  bottom: calc(var(--pad) + 2.4em);
+  translate: -50% 0;
+  font-size: clamp(11px, 5.6cqmin, 24px);
+  padding: 0.35em 0.7em;
+  border-radius: 99px;
+}
+.bp-badge.is-small small {
+  display: inline;
+  margin: 0 0 0 0.5em;
+  font-size: 1em;
+  letter-spacing: 0.04em;
+}
+/* The state in words, for forced-colors mode only (everything else is the same color there). */
+.bp-fc {
+  display: none;
+}
+
+/* Grid while connecting: no interaction affordances. */
+.bp-grid[data-link='connecting'] .bp-btn {
+  cursor: default;
+}
+
+/* ---- SHOW MODE (device setting): a dark house -------------------------------------------
+   Every face is its hue dimmed to the same low lightness (ButtonFace sets --bg/--ink/--edge from
+   lib/color.ts showPalette: ink ≥ 7:1 on it), with a thin edge in the hue. A result is a colored
+   edge + glyph + text on a near-black face, never a full-tile flood; FAILURE keeps its hatching
+   (in red), and its pulse moves the edge, not the brightness. No white flashes: the fire flash is
+   faint, badges and pills are dim. Motion and shape still tell the states apart. */
+.bp-btn[data-show] {
+  --ok: #3fb56c;
+  --bad: #e5484d;
+  --stop: #8a94a3;
+  --amber: #d29a1e;
+  --ok-ink: #04140a;
+  --warn-ink: #1a1200;
+  --sh-face: #0c0d10;
+}
+.bp-btn[data-show] .bp-base {
+  background: var(--bg);
+  box-shadow: inset 0 0 0 max(2px, 0.9cqmin) var(--edge);
+}
+.bp-btn[data-show] .bp-arm::after {
+  opacity: 0.2;
+}
+.bp-btn[data-show] .bp-flash {
+  background: var(--ink);
+}
+.bp-btn[data-show] .bp-flood,
+.bp-btn[data-show] .bp-pulse {
+  display: none;
+}
+/* CONFIRM: the amber frame still blinks, dim and softer. */
+.bp-btn[data-show][data-visual='confirm'] .bp-face {
+  --ink: inherit;
+}
+.bp-btn[data-show][data-visual='confirm'] .bp-base {
+  filter: brightness(0.75);
+}
+.bp-btn[data-show][data-visual='confirm'] .bp-frame {
+  border-color: var(--amber);
+  animation: bp-blink-soft 1s steps(1, end) infinite;
+}
+.bp-btn[data-show][data-visual='running'] .bp-base {
+  filter: none;
+}
+.bp-btn[data-show] .bp-stripes {
+  opacity: 0.14;
+}
+.bp-btn[data-show] .bp-stripes.is-under {
+  opacity: 0.08;
+}
+.bp-btn[data-show] .bp-prog::before {
+  opacity: 0.16;
+}
+.bp-btn[data-show] .bp-prog::after {
+  opacity: 0.4;
+}
+/* Results: --res is the result's color (edge, glyph, countdown), --res-text its lighter tint (text). */
+.bp-btn[data-show][data-visual='success'] .bp-face {
+  --ink: inherit;
+  --res: var(--ok);
+  --res-text: #8fd9aa;
+}
+.bp-btn[data-show][data-visual='failure'] .bp-face {
+  --ink: inherit;
+  --res: var(--bad);
+  --res-text: #f3a1a3;
+}
+.bp-btn[data-show][data-visual='stopped'] .bp-face {
+  --ink: inherit;
+  --res: var(--stop);
+  --res-text: #c6ccd5;
+}
+.bp-btn[data-show]:is([data-visual='unknown'], [data-visual='interrupted']) .bp-face {
+  --ink: inherit;
+  --res: var(--amber);
+  --res-text: #ecc673;
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-base {
+  background: color-mix(in srgb, var(--res) 9%, var(--sh-face));
+  box-shadow: none;
+}
+.bp-btn[data-show][data-visual='interrupted'] .bp-base {
+  background:
+    repeating-linear-gradient(-45deg, color-mix(in srgb, var(--amber) 15%, transparent) 0 max(10px, 6cqmin), transparent 0 max(20px, 12cqmin)),
+    var(--sh-face);
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-frame {
+  border: max(4px, 2.6cqmin) solid var(--res);
+  opacity: 1;
+  animation: bp-fade 0.35s ease-out both;
+}
+.bp-btn[data-show][data-visual='unknown'] .bp-frame {
+  border-style: dashed;
+}
+/* The pulse of a failure (and INTERRUPTED) moves the edge: motion without a flash. */
+.bp-btn[data-show]:is([data-visual='failure'], [data-visual='interrupted']) .bp-frame {
+  animation:
+    bp-fade 0.35s ease-out both,
+    bp-pulse-edge 1.6s ease-in-out 0.5s infinite;
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
+  color: var(--res);
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) :is(.bp-headline, .bp-sub, .bp-sticky) {
+  color: var(--res-text);
+}
+.bp-btn[data-show] .bp-hatch {
+  --hc: color-mix(in srgb, var(--bad) 45%, transparent);
+}
+.bp-btn[data-show] .bp-drain {
+  background: var(--res, var(--ink));
+  opacity: 0.75;
+}
+.bp-btn[data-show] .bp-drain-confirm {
+  background: var(--amber);
+}
+.bp-btn[data-show] :is(.bp-pill, .bp-next) {
+  background: transparent;
+  color: var(--res-text, var(--ink));
+  box-shadow: inset 0 0 0 0.12em currentColor;
+}
+.bp-btn[data-show] .bp-badge {
+  color: #c9ced6;
+  box-shadow: 0 0 0 0.07em #c9ced666;
+}
+/* Latched state (`@state`): still a solid chip, but the face's hue a step lighter with the ink on
+   it, not a chip in the ink (QA: "ON 80%" was the brightest thing on the pad, 0.35 on a 0.025 face). */
+.bp-btn[data-show] .bp-latched:not(.is-uncertain) {
+  background: var(--chip, var(--sh-face));
+  color: var(--ink);
+}
+.bp-btn[data-show][data-visual='offline'] .bp-face {
+  --ink: #a3abb6;
+}
+.bp-btn[data-show][data-visual='offline'] .bp-base {
+  background: #1b1e23;
+}
+.bp-btn[data-show][data-visual='offline'] .bp-frame {
+  border-color: #5d6672;
+}
+.bp-btn[data-show][data-visual='syncing'] .bp-base {
+  filter: brightness(0.7) saturate(0.6);
+}
+.bp-btn[data-show][data-visual='syncing'] .bp-face {
+  --ink: inherit;
+}
+@keyframes bp-blink-soft {
+  50% {
+    opacity: 0.4;
+  }
+}
+@keyframes bp-pulse-edge {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* ---- keyframes ------------------------------------------------------------------------ */
+
+@keyframes bp-stripes {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(var(--sp));
+  }
+}
+@keyframes bp-flood {
+  from {
+    transform: scale(0.04);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes bp-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.3) rotate(-12deg);
+  }
+}
+@keyframes bp-shake-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  30% {
+    opacity: 1;
+    transform: scale(1.08) translateX(0);
+  }
+  45% {
+    transform: translateX(-9%);
+  }
+  60% {
+    transform: translateX(8%);
+  }
+  75% {
+    transform: translateX(-4%);
+  }
+  100% {
+    transform: none;
+  }
+}
+@keyframes bp-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+@keyframes bp-drain {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+@keyframes bp-dot {
+  0%,
+  100% {
+    transform: scale(0.45);
+    opacity: 0.45;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes bp-settle {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+}
+@keyframes bp-nudge {
+  50% {
+    transform: scale(1.04);
+  }
+}
+@keyframes bp-badge {
+  0% {
+    opacity: 0;
+    transform: scale(0.55);
+  }
+  12% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+  22% {
+    transform: scale(1);
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+/* No container queries (iOS < 16): viewport-based sizes keep it usable. */
+@supports not (container-type: size) {
+  .bp-btn .bp-label,
+  .bp-btn .bp-head {
+    font-size: clamp(16px, 6vmin, 72px) !important;
+  }
+  .bp-btn .bp-num {
+    font-size: clamp(20px, 9vmin, 96px) !important;
+  }
+  .bp-btn .bp-headline {
+    font-size: clamp(14px, 5vmin, 48px) !important;
+  }
+  .bp-btn .bp-sub,
+  .bp-btn .bp-pill {
+    font-size: clamp(11px, 3.4vmin, 28px) !important;
+  }
+  .bp-icon {
+    flex-basis: 14vmin;
+  }
+}
+
+/* Reduced motion: keep every shape cue, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .bp-stripes,
+  .bp-pulse,
+  .bp-head,
+  .bp-icon,
+  .bp-flood,
+  .bp-hatch,
+  .bp-label {
+    animation: none !important;
+  }
+  .bp-btn[data-visual='confirm'] .bp-frame,
+  .bp-btn[data-show] .bp-frame {
+    animation: none;
+  }
+}
+
+/* Forced colors (Windows high contrast): the browser repaints every face in two colors, so the
+   states are told apart by edges, fills in the highlight color, and words. */
+@media (forced-colors: active) {
+  .bp-face {
+    border: 2px solid ButtonText;
+  }
+  /* FAILURE's cross-hatching survives in the text color. */
+  .bp-hatch {
+    forced-color-adjust: none;
+    --hc: CanvasText;
+    opacity: 0.3;
+  }
+  .bp-arm::before,
+  .bp-arm::after,
+  .bp-prog::before,
+  .bp-prog::after,
+  .bp-drain,
+  .bp-pips i:first-child {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+  .bp-pips i {
+    forced-color-adjust: none;
+    border-color: CanvasText;
+  }
+  .bp-stripes {
+    forced-color-adjust: none;
+    background: repeating-linear-gradient(-45deg, transparent 0 var(--sw), Highlight var(--sw) calc(var(--sw) * 2));
+    opacity: 0.45;
+  }
+  .bp-btn[data-visual='confirm'] .bp-frame {
+    border-color: Highlight;
+  }
+  .bp-btn[data-visual='running'] .bp-face {
+    border: 4px dotted Highlight;
+  }
+  .bp-btn[data-visual='success'] .bp-face {
+    border: 6px double CanvasText;
+  }
+  .bp-btn:is([data-visual='failure'], [data-visual='interrupted']) .bp-face {
+    border: 8px solid CanvasText;
+  }
+  .bp-btn:is([data-visual='stopped'], [data-visual='unknown']) .bp-face {
+    border: 4px dashed CanvasText;
+  }
+  .bp-fc {
+    display: block;
+    position: absolute;
+    z-index: 4;
+    top: calc(var(--pad) * 0.6);
+    left: 50%;
+    translate: -50% 0;
+    padding: 0.2em 0.5em;
+    border: 2px solid CanvasText;
+    border-radius: 0.3em;
+    font-weight: 900;
+    font-size: clamp(10px, 4.4cqmin, 18px);
+    letter-spacing: 0.1em;
+    white-space: nowrap;
+  }
+  .bp-latched,
+  .bp-pill,
+  .bp-next {
+    border: 2px solid CanvasText;
+  }
+  .bp-dismiss {
+    border: 2px solid ButtonText;
+  }
+}
